@@ -1,0 +1,25 @@
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Database files
+data/
+*.sqlite
+*.sqlite3
+*.db
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Logs and local files
+*.log
+.DS_Store
+.pytest_cache/

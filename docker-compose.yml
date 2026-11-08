@@ -1,0 +1,13 @@
+services:
+  gatekeeper:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DB_PATH: /app/data/gatekeeper.sqlite3
+    volumes:
+      - gatekeeper_data:/app/data
+    stop_grace_period: 40s
+
+volumes:
+  gatekeeper_data:

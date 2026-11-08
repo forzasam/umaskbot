@@ -1,0 +1,4 @@
+discord.py>=2.6.0,<3.0
+argon2-cffi>=23.1,<27
+cryptography>=44,<48
+python-dotenv>=1.0,<2
