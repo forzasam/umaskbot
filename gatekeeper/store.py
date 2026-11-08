@@ -42,6 +42,9 @@ class Store:
             );
             CREATE INDEX IF NOT EXISTS session_history_guild_ended
               ON session_history(guild_id, ended_at DESC, id DESC);
+            CREATE TABLE IF NOT EXISTS departed_guilds (
+              guild_id INTEGER PRIMARY KEY, removed_at INTEGER NOT NULL
+            );
         """)
         # In-place upgrade for databases created by Gatekeeper v0.1.
         # Existing active sessions and credentials are preserved.
@@ -54,6 +57,11 @@ class Store:
         credential_columns = {row['name'] for row in self.conn.execute("PRAGMA table_info(credentials)")}
         if 'collected_at' not in credential_columns:
             self.conn.execute("ALTER TABLE credentials ADD COLUMN collected_at INTEGER")
+        history_columns = {r['name'] for r in self.conn.execute("PRAGMA table_info(session_history)")}
+        if 'hold_until' not in history_columns:
+            self.conn.execute("ALTER TABLE session_history ADD COLUMN hold_until INTEGER")
+        if 'hold_reference' not in history_columns:
+            self.conn.execute("ALTER TABLE session_history ADD COLUMN hold_reference TEXT")
 
     @contextmanager
     def tx(self):
@@ -208,3 +216,113 @@ class Store:
     def delete_session(self,guild_id,user_id):
         # Compatibility with v0.1 call sites. Prefer explicit reasons in new code.
         return self.end_session(guild_id,user_id,"removed")
+
+    # Retention and case-specific privacy decisions. Background cleanup never
+    # removes active sessions or authentication credentials.
+    def purge_history(self, cutoff: int, now: int) -> int:
+        with self.tx():
+            cur = self.conn.execute('''DELETE FROM session_history
+                WHERE ended_at < ? AND (hold_until IS NULL OR hold_until <= ?)''',
+                (cutoff, now))
+            return cur.rowcount
+
+    def hold_history(self, row_id: int, guild_id: int, user_id: int,
+                     until: int, reference: str) -> bool:
+        if not reference or len(reference) > 64:
+            raise ValueError('case reference required')
+        with self.tx():
+            cur = self.conn.execute('''UPDATE session_history
+                SET hold_until=?,hold_reference=? WHERE id=? AND guild_id=? AND user_id=?''',
+                (until, reference, row_id, guild_id, user_id))
+            return cur.rowcount == 1
+
+    def release_history(self, row_id: int, guild_id: int, user_id: int) -> bool:
+        with self.tx():
+            cur = self.conn.execute('''UPDATE session_history
+                SET hold_until=NULL,hold_reference=NULL
+                WHERE id=? AND guild_id=? AND user_id=?''', (row_id, guild_id, user_id))
+            return cur.rowcount == 1
+
+    def privacy_counts(self, *, guild_id: int | None = None,
+                       user_id: int | None = None) -> dict:
+        filters = []
+        args = []
+        if guild_id is not None:
+            filters.append('guild_id=?'); args.append(int(guild_id))
+        if user_id is not None:
+            filters.append('user_id=?'); args.append(int(user_id))
+        where = (' WHERE ' + ' AND '.join(filters)) if filters else ''
+        return {table: self.conn.execute('SELECT COUNT(*) FROM ' + table + where, args).fetchone()[0]
+                for table in ('credentials', 'sessions', 'session_history')}
+
+    def history_rows_for_review(self, guild_id: int, user_id: int, limit: int = 8):
+        return self.conn.execute('''SELECT id,started_at,ended_at,end_reason,hold_until
+            FROM session_history WHERE guild_id=? AND user_id=?
+            ORDER BY ended_at DESC LIMIT ?''',(guild_id,user_id,limit)).fetchall()
+
+    def apply_erasure_event(self, event: dict, now: int):
+        """Reapply after restoring a snapshot, retaining unreconciled sessions.
+
+        Only data from before the approved request is affected: if a server is
+        reconfigured or new access is issued later, that isn't silently erased.
+        """
+        scope = event['type']
+        at = int(event['created_at'])
+        gid = event.get('guild_id')
+        uid = event.get('user_id')
+        terms, vals = [], []
+        if gid is not None:
+            terms.append('guild_id=?'); vals.append(int(gid))
+        if scope in {'erase_user', 'erase_history'}:
+            terms.append('user_id=?'); vals.append(int(uid))
+        selector = ' AND '.join(terms)
+        with self.tx():
+            if scope != 'erase_history':
+                self.conn.execute(f'DELETE FROM credentials WHERE {selector} AND issued_at<=?', (*vals,at))
+                self.conn.execute(f'''UPDATE sessions SET termination_reason='privacy_erasure'
+                    WHERE {selector} AND started_at<=?''', (*vals,at))
+            self.conn.execute(f'''DELETE FROM session_history WHERE {selector} AND started_at<=?
+                AND (hold_until IS NULL OR hold_until<=?)''', (*vals,at,now))
+            if scope == 'erase_guild':
+                # Keep config if a revocation still requires the role IDs.
+                pending = self.conn.execute('''SELECT COUNT(*) FROM sessions
+                    WHERE guild_id=? AND started_at<=?''', (int(gid), at)).fetchone()[0]
+                if not pending:
+                    self.conn.execute('''DELETE FROM guild_config
+                        WHERE guild_id=? AND updated_at<=?''', (int(gid),at))
+
+    def erasure_pending(self, event: dict) -> bool:
+        if event['type'] == 'erase_history':
+            return False
+        terms, values = ['started_at<=?'], [int(event['created_at'])]
+        if event.get('guild_id') is not None:
+            terms.append('guild_id=?'); values.append(int(event['guild_id']))
+        if event.get('user_id') is not None:
+            terms.append('user_id=?'); values.append(int(event['user_id']))
+        return bool(self.conn.execute(
+            'SELECT 1 FROM sessions WHERE '+' AND '.join(terms)+' LIMIT 1',values).fetchone())
+
+    def mark_guild_removed(self, guild_id: int, now: int) -> None:
+        self.conn.execute('''INSERT INTO departed_guilds(guild_id,removed_at) VALUES (?,?)
+            ON CONFLICT(guild_id) DO UPDATE SET removed_at=excluded.removed_at''', (guild_id,now))
+
+    def mark_guild_joined(self, guild_id: int) -> None:
+        self.conn.execute('DELETE FROM departed_guilds WHERE guild_id=?',(guild_id,))
+
+    def purge_departed_guilds(self, cutoff: int, now: int) -> int:
+        """Seven-day grace; never discard unresolved role revocations or held history."""
+        count=0
+        with self.tx():
+            for row in self.conn.execute('SELECT guild_id FROM departed_guilds WHERE removed_at<?',(cutoff,)).fetchall():
+                gid=row['guild_id']
+                if self.conn.execute('SELECT 1 FROM sessions WHERE guild_id=? LIMIT 1',(gid,)).fetchone():
+                    continue
+                if self.conn.execute('''SELECT 1 FROM session_history
+                    WHERE guild_id=? AND hold_until>? LIMIT 1''',(gid,now)).fetchone():
+                    continue
+                self.conn.execute('DELETE FROM credentials WHERE guild_id=?',(gid,))
+                self.conn.execute('DELETE FROM session_history WHERE guild_id=?',(gid,))
+                self.conn.execute('DELETE FROM guild_config WHERE guild_id=?',(gid,))
+                self.conn.execute('DELETE FROM departed_guilds WHERE guild_id=?',(gid,))
+                count+=1
+        return count

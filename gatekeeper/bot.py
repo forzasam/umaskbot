@@ -15,6 +15,9 @@ from cryptography.fernet import InvalidToken
 
 from .crypto import build_fernet, generate_phrase, hash_phrase, verify_phrase
 from .store import Store
+from .mysql_store import MySQLStore
+from .privacy import PrivacyLedger, backup_sqlite
+from .privacy_ops import register_privacy_ops
 
 log = logging.getLogger("gatekeeper")
 load_dotenv()
@@ -91,8 +94,20 @@ class Umask(commands.Bot):
         intents.guilds = True
         super().__init__(command_prefix=commands.when_mentioned, intents=intents,
                          allowed_mentions=discord.AllowedMentions.none())
-        self.store = Store(os.environ.get("DB_PATH", "./data/gatekeeper.sqlite3"))
+        backend = os.getenv('DB_BACKEND', 'sqlite').strip().lower()
+        if backend == 'mysql':
+            self.store = MySQLStore.from_env()
+        elif backend == 'sqlite':
+            self.store = Store(os.environ.get('DB_PATH', './data/gatekeeper.sqlite3'))
+        else:
+            raise ValueError('DB_BACKEND must be sqlite or mysql')
         self.fernet = build_fernet(os.environ["ESCROW_FERNET_KEY"])
+        self.privacy_ledger = PrivacyLedger(
+            os.getenv('PRIVACY_LEDGER_PATH', './private/erasure-ledger.jsonl'),
+            require_existing=os.getenv('PRIVACY_LEDGER_REQUIRE_EXISTING', '0') == '1')
+        # Apply erasures BEFORE connecting to Discord; restored credentials must
+        # never become usable during startup even if reconciliation later fails.
+        self.privacy_ledger.apply(self.store)
         self.locks: dict[tuple[int, int], asyncio.Lock] = defaultdict(asyncio.Lock)
         self.reconcile_lock = asyncio.Lock()
         self.deletion_tasks: set[asyncio.Task] = set()
@@ -110,7 +125,17 @@ class Umask(commands.Bot):
         else:
             await self.tree.sync()
             log.info("Synced global commands (Discord may take time to display them)")
+        ops_id = os.getenv('PRIVACY_ADMIN_GUILD_ID', '').strip()
+        if ops_id:
+            register_privacy_ops(self, int(ops_id))
+            # Never expose operator commands globally.
+            if ops_id == dev_guild:
+                await self.tree.sync(guild=discord.Object(id=int(ops_id)))
+            else:
+                await self.tree.sync(guild=discord.Object(id=int(ops_id)))
+            log.info('Installed private operator commands in guild=%s', ops_id)
         self.reconciler.start()
+        self.maintenance_loop.start()
         # Docker normally sends SIGTERM. Allow time to revoke tracked roles
         # before terminating; SIGKILL and network outages remain unpreventable.
         try:
@@ -121,7 +146,23 @@ class Umask(commands.Bot):
 
     async def on_ready(self):
         log.info("Connected as %s (%s)", self.user, self.user.id if self.user else "unknown")
-        await self.reconcile()
+        try:
+            await self.reconcile()
+        except Exception:
+            log.exception("Startup reconciliation failed; the regular retry loop will retry")
+
+    async def on_guild_remove(self, guild: discord.Guild):
+        try:
+            self.store.mark_guild_removed(guild.id, int(time.time()))
+            log.info('Guild removed Umask; scheduled privacy cleanup after grace period guild=%s', guild.id)
+        except Exception:
+            log.exception('Could not record guild removal; manual follow-up required')
+
+    async def on_guild_join(self, guild: discord.Guild):
+        try:
+            self.store.mark_guild_joined(guild.id)
+        except Exception:
+            log.exception('Could not clear departed-guild record')
 
     async def bot_member(self, guild: discord.Guild) -> discord.Member:
         me = guild.me
@@ -169,9 +210,12 @@ class Umask(commands.Bot):
             return
         async with self.reconcile_lock:
             now = int(time.time())
+            self.privacy_ledger.apply(self.store, now=now)
             self.store.purge_pending(now)
             for row in self.store.all_sessions():
                 await self.reconcile_one(row['guild_id'], row['user_id'], now)
+            # Role revocation may have just created a final history row.
+            self.privacy_ledger.apply(self.store, now=now)
 
     async def reconcile_one(self, guild_id: int, user_id: int, now: int | None = None):
         now = int(time.time()) if now is None else now
@@ -217,10 +261,43 @@ class Umask(commands.Bot):
 
     @tasks.loop(seconds=60)
     async def reconciler(self):
-        await self.reconcile()
+        # A temporary network/database outage must not permanently stop expiry
+        # reconciliation. Active roles may still remain during the outage.
+        try:
+            await self.reconcile()
+        except Exception:
+            log.exception("Session reconciliation failed; retrying on next cycle")
 
     @reconciler.before_loop
     async def before_reconcile(self):
+        await self.wait_until_ready()
+
+    @tasks.loop(hours=24)
+    async def maintenance_loop(self):
+        # Daily housekeeping runs in the bot process (PebbleHost has no shell).
+        # This does NOT approve or process incoming privacy requests.
+        try:
+            await self.reconcile()
+            now = int(time.time())
+            removed = self.store.purge_history(now - 90 * 86400, now)
+            departed_removed = self.store.purge_departed_guilds(now - 7 * 86400, now)
+            self.privacy_ledger.apply(self.store, now=now)
+            pruned = self.privacy_ledger.rotate(self.store, now=now, retention_days=365)
+            if pruned:
+                log.info('Pruned %s resolved privacy ledger entries beyond 12 months', pruned)
+            if isinstance(self.store, Store):
+                snapshot = backup_sqlite(self.store, os.getenv('LOCAL_BACKUP_DIR', './backups'),
+                                         now=now, keep_days=7)
+                log.info('Daily SQLite snapshot verified: %s', snapshot.name)
+            else:
+                log.warning('MySQL selected: built-in SQLite snapshots unavailable; configure provider backups')
+            log.info('Maintenance completed; expired history=%s cleared departed servers=%s',
+                     removed, departed_removed)
+        except Exception:
+            log.exception('Daily maintenance failed; will retry next cycle')
+
+    @maintenance_loop.before_loop
+    async def before_maintenance(self):
         await self.wait_until_ready()
 
     async def _drain_roles(self):
@@ -249,6 +326,8 @@ class Umask(commands.Bot):
             self._closing_gatekeeper = True
             if self.reconciler.is_running():
                 self.reconciler.cancel()
+            if self.maintenance_loop.is_running():
+                self.maintenance_loop.cancel()
             if self.is_ready():
                 try:
                     await asyncio.wait_for(self._drain_roles(), timeout=25)
@@ -540,6 +619,9 @@ class SetupWizard(discord.ui.View):
             current_snapshot = (tuple(current[k] for k in ('staff_role_id', 'elevated_role_id', 'durations', 'alert_channel_id', 'updated_at')) if current else None)
             if current_snapshot != self.config_snapshot:
                 raise ValueError("Setup has changed since this form was opened. Run `/setup` again to review the latest configuration.")
+            if (current and bot.privacy_ledger.guild_pending_erasure(guild.id, current['updated_at'])
+                    and bot.store.count_sessions(guild.id)):
+                raise ValueError("This server's privacy deletion is awaiting role cleanup. Wait until all tracked sessions are safely removed before reconfiguring.")
             changed = bot.store.set_config(guild.id, staff.id, elevated.id, allowed,
                                            channel.id if channel else None)
         except (ValueError, discord.HTTPException) as exc:
@@ -614,6 +696,8 @@ async def issue(interaction: discord.Interaction, member: discord.Member):
     cfg = bot.store.config(interaction.guild_id)
     if not cfg:
         return await reply(interaction, "Run `/setup` first.")
+    if bot.privacy_ledger.guild_pending_erasure(interaction.guild_id, cfg['updated_at']):
+        return await reply(interaction, "This server's previous Umask setup is being removed under a verified privacy request. Reconfigure only after pending roles are cleared.")
     if member.bot or member.id == interaction.guild.owner_id:
         return await reply(interaction, "Choose a human staff member who is not the server owner.")
     async with bot.lock(interaction.guild_id, member.id):
@@ -694,6 +778,8 @@ class AuthenticationModal(discord.ui.Modal, title="Umask — Authenticate"):
             cfg = bot.store.config(gid)
             if not cfg:
                 return await reply(interaction, "Umask is not configured.")
+            if bot.privacy_ledger.guild_pending_erasure(gid, cfg['updated_at']):
+                return await reply(interaction, "This server's Umask setup is pending deletion; authentication is disabled until it is reconfigured.")
             allowed = parse_durations(cfg['durations'])
             if self.duration not in allowed:
                 return await reply(interaction, f"The owner permits: {', '.join(map(str, allowed))} minutes.")
@@ -758,6 +844,8 @@ async def authenticate(interaction: discord.Interaction, duration_minutes: int |
     cfg = bot.store.config(interaction.guild_id)
     if not cfg:
         return await reply(interaction, "Umask is not configured on this server.")
+    if bot.privacy_ledger.guild_pending_erasure(interaction.guild_id, cfg['updated_at']):
+        return await reply(interaction, "The server's previous Umask setup is pending deletion.")
     allowed = parse_durations(cfg['durations'])
     duration = duration_minutes if duration_minutes is not None else (60 if 60 in allowed else allowed[0])
     if duration not in allowed:
