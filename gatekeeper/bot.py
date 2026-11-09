@@ -179,6 +179,47 @@ class Umask(commands.Bot):
         except Exception:
             log.exception('Could not clear departed-guild record')
 
+        # Optional join log for the application's private admin server.
+        # PRIVACY_ADMIN_GUILD_ID identifies that server; ADMIN_LOG_CHANNEL is
+        # the numeric ID of a text channel within it. Neither is a new intent.
+        channel_id = os.getenv('ADMIN_LOG_CHANNEL', '').strip()
+        if not channel_id:
+            return
+        try:
+            channel_id_int = int(channel_id)
+        except ValueError:
+            log.warning('ADMIN_LOG_CHANNEL must be a numeric Discord channel ID')
+            return
+
+        admin_guild_id = os.getenv('PRIVACY_ADMIN_GUILD_ID', '').strip()
+        if not admin_guild_id:
+            log.warning('ADMIN_LOG_CHANNEL requires PRIVACY_ADMIN_GUILD_ID; join notice skipped')
+            return
+        if str(guild.id) == admin_guild_id:
+            return  # Joining the admin server itself is not a new public install.
+
+        try:
+            channel = self.get_channel(channel_id_int)
+            if channel is None:
+                channel = await self.fetch_channel(channel_id_int)
+            # Never post installation records outside the configured admin guild.
+            if str(channel.guild.id) != admin_guild_id:
+                log.warning('ADMIN_LOG_CHANNEL is not in PRIVACY_ADMIN_GUILD_ID; join notice skipped')
+                return
+            if not isinstance(channel, discord.TextChannel):
+                log.warning('ADMIN_LOG_CHANNEL must refer to a text channel; join notice skipped')
+                return
+            guild_name = discord.utils.escape_markdown(guild.name)
+            message = (
+                f'**Joined a server**\n'
+                f'**Server:** {guild_name} (`{guild.id}`)\n'
+                f'**Owner ID:** `{guild.owner_id}`\n'
+                f'**Connected servers:** {len(self.guilds)}'
+            )
+            await channel.send(message, allowed_mentions=discord.AllowedMentions.none())
+        except (discord.HTTPException, AttributeError):
+            log.exception('Could not send guild join notice for guild=%s', guild.id)
+
     async def bot_member(self, guild: discord.Guild) -> discord.Member:
         me = guild.me
         if me is None:
