@@ -4,8 +4,9 @@ import logging
 import os
 import signal
 import time
-from collections import defaultdict
+import traceback
 from pathlib import Path
+from collections import defaultdict
 
 import discord
 from discord import app_commands
@@ -29,21 +30,13 @@ load_dotenv()
 LAVENDER = 0xB0A8FF
 SLATE = 0x56566B
 SOFT_WARNING = 0xC88FA8
-LOGO_FILE = Path(__file__).resolve().parent / "assets" / "umask-mark.png"
 
 
-def brand_embed(title: str, description: str = "", *, accent: str = "primary",
-                logo: bool = False) -> discord.Embed:
+def brand_embed(title: str, description: str = "", *, accent: str = "primary") -> discord.Embed:
     colours = {"primary": LAVENDER, "muted": SLATE, "warning": SOFT_WARNING}
-    embed = discord.Embed(title=f"umask · {title}", description=description,
+    embed = discord.Embed(title=title, description=description,
                           colour=colours.get(accent, LAVENDER))
-    if logo and LOGO_FILE.is_file():
-        embed.set_thumbnail(url="attachment://umask-mark.png")
     return embed
-
-
-def logo_attachment() -> discord.File | None:
-    return discord.File(LOGO_FILE, filename="umask-mark.png") if LOGO_FILE.is_file() else None
 
 
 # These guild-level powers are meaningful to protect from a compromised session.
@@ -118,6 +111,7 @@ class Umask(commands.Bot):
         self.process_started = time.monotonic()
         self.last_reconciliation_at: int | None = None
         self.last_maintenance_at: int | None = None
+        self.monitor_offset = 0
         self.maintenance_state = MaintenanceState(
             os.getenv('MAINTENANCE_STATE_PATH', './private/maintenance.json'),
             require_existing=os.getenv('MAINTENANCE_REQUIRE_EXISTING', '0') == '1')
@@ -144,6 +138,19 @@ class Umask(commands.Bot):
             log.info('Installed private operator commands in guild=%s', ops_id)
         self.reconciler.start()
         self.maintenance_loop.start()
+        self.credential_monitor.start()
+        # Reattach buttons sent by the monitor in earlier process lifetimes.
+        # View custom IDs are scoped to the stored guild/user and recheck owner
+        # identity on every click. No privileged member-list intent is needed.
+        offset = 0
+        while True:
+            batch = self.store.monitor_credential_batch(100, offset)
+            for row in batch:
+                if row['staff_loss_notified_at'] is not None:
+                    self.add_view(StaffLossRevokeView(int(row['guild_id']), int(row['user_id'])))
+            if len(batch) < 100:
+                break
+            offset += len(batch)
         # Docker normally sends SIGTERM. Allow time to revoke tracked roles
         # before terminating; SIGKILL and network outages remain unpreventable.
         try:
@@ -253,6 +260,9 @@ class Umask(commands.Bot):
                     self.store.end_session(guild_id, user_id, reason, now)
                     return
                 cfg = self.store.config(guild_id)
+                # Revoke the active elevated role if the permanent staff role is
+                # lost. This is an existing security boundary and must not be
+                # delayed by the optional five-minute owner DM grace period.
                 staff_still_authorised = bool(cfg and cfg['staff_role_id'] in {r.id for r in member.roles}
                                                and cfg['elevated_role_id'] == role.id)
                 unsafe_role = role.permissions.administrator or role.permissions.manage_roles
@@ -269,6 +279,91 @@ class Umask(commands.Bot):
             except (discord.Forbidden, discord.HTTPException):
                 # Never forget the session when Discord could still have the role.
                 log.exception("Failed to reconcile staff role in guild=%s user=%s", guild_id, user_id)
+
+    async def monitor_credential_holder(self, row: dict, now: int) -> None:
+        """Monitor only accounts already issued a credential, never all members.
+
+        A five-minute grace starts at first *detected* role loss. Only sends an
+        informational DM; it never changes an active session or credential.
+        """
+        gid, uid = int(row['guild_id']), int(row['user_id'])
+        guild = self.get_guild(gid)
+        if guild is None:
+            return
+        cfg = self.store.config(gid)
+        if cfg is None or self.store.credential(gid, uid) is None:
+            return
+        member = await self.get_member(guild, uid)
+        staff_present = bool(member and cfg['staff_role_id'] in {r.id for r in member.roles})
+        missing_since = row['staff_missing_since']
+        notified = row['staff_loss_notified_at']
+        if staff_present:
+            if missing_since is not None or notified is not None:
+                self.store.mark_staff_role_state(gid, uid, None, None)
+        else:
+            # Avoid a notification for a user who left the server entirely;
+            # guild removal and privacy cleanup are handled separately.
+            if member is None:
+                return
+            if missing_since is None:
+                self.store.mark_staff_role_state(gid, uid, now, None)
+            elif not notified and now - int(missing_since) >= 300:
+                label = safe_display_label(member.display_name, uid)
+                e = brand_embed('Staff role removed',
+                    f'{label} no longer holds the permanent staff role in **{discord.utils.escape_markdown(guild.name)}**.\n\n'
+                    'Their authentication code cannot be used unless that role is restored. '
+                    'Would you like to revoke the code?')
+                owner = await self.fetch_user(guild.owner_id)
+                await owner.send(embed=e, view=StaffLossRevokeView(gid, uid))
+                self.store.mark_staff_role_state(gid, uid, int(missing_since), now)
+        if not staff_present:
+            return
+        # Report existing Administrator/Manage Roles bypasses only for staff
+        # already protected by Umask. Deduplicate on offending role IDs.
+        dangerous = sorted(r.id for r in member.roles if r.id != cfg['elevated_role_id']
+                           and (r.permissions.administrator or r.permissions.manage_roles))
+        fingerprint = ','.join(map(str, dangerous)) if dangerous else None
+        if fingerprint == row['permission_warning_key']:
+            return
+        if fingerprint is None:
+            self.store.mark_permission_warning(gid, uid, None)
+            return
+        labels = ', '.join(discord.utils.escape_markdown(guild.get_role(i).name)
+                           for i in dangerous if guild.get_role(i))
+        e = brand_embed('Staff permissions need review',
+            f'{safe_display_label(member.display_name,uid)} has Administrator or Manage Roles '
+            f'from another role in **{discord.utils.escape_markdown(guild.name)}** '
+            f'({labels or "unknown role"}).\n\n'
+            'Umask cannot limit permissions the member already has. '
+            'Review their permanent roles in Discord.')
+        owner = await self.fetch_user(guild.owner_id)
+        await owner.send(embed=e)
+        self.store.mark_permission_warning(gid, uid, fingerprint)
+
+    @tasks.loop(seconds=60)
+    async def credential_monitor(self):
+        """A bounded best-effort scan, intentionally avoiding GUILD_MEMBERS."""
+        try:
+            batch = self.store.monitor_credential_batch(40, self.monitor_offset)
+            if not batch and self.monitor_offset:
+                self.monitor_offset = 0
+                batch = self.store.monitor_credential_batch(40, 0)
+            self.monitor_offset += len(batch)
+            for row in batch:
+                try:
+                    await self.monitor_credential_holder(row, int(time.time()))
+                except (discord.Forbidden, discord.HTTPException):
+                    log.warning('Could not check or notify credential holder guild=%s user=%s',
+                                row['guild_id'], row['user_id'])
+                except Exception:
+                    log.exception('Credential monitor failed guild=%s user=%s',
+                                  row['guild_id'], row['user_id'])
+        except Exception:
+            log.exception('Credential monitoring scan failed; retrying next cycle')
+
+    @credential_monitor.before_loop
+    async def before_credential_monitor(self):
+        await self.wait_until_ready()
 
     @tasks.loop(seconds=60)
     async def reconciler(self):
@@ -394,6 +489,8 @@ class Umask(commands.Bot):
                 self.reconciler.cancel()
             if self.maintenance_loop.is_running():
                 self.maintenance_loop.cancel()
+            if self.credential_monitor.is_running():
+                self.credential_monitor.cancel()
             if self.is_ready():
                 try:
                     await asyncio.wait_for(self._drain_roles(), timeout=25)
@@ -424,7 +521,7 @@ def require_owner(interaction: discord.Interaction) -> bool:
     return interaction.guild is not None and interaction.user.id == interaction.guild.owner_id
 
 
-@bot.tree.command(name="support", description="Get Umask's support server and contact email")
+@bot.tree.command(name="support", description="Get support links and contact details.")
 async def support(interaction: discord.Interaction):
     url = support_invite(os.getenv('SUPPORT_SERVER_URL', ''))
     e = brand_embed('Support', 'Need help setting up Umask or reporting an issue?')
@@ -433,6 +530,13 @@ async def support(interaction: discord.Interaction):
                 value=f'[Join the Umask support server]({url})' if url else
                 'Invite link not configured yet. Email us for an invite.', inline=False)
     await interaction.response.send_message(embed=e, ephemeral=True)
+
+
+@bot.tree.command(name="ping", description="Check the bot's connection.")
+async def ping(interaction: discord.Interaction):
+    latency = bot.latency
+    value = f'Pong! Gateway latency: {round(latency * 1000)} ms.' if latency >= 0 else 'Pong! Gateway latency unavailable.'
+    await interaction.response.send_message(value, ephemeral=True)
 
 
 # The setup wizard deliberately uses a standard ephemeral View rather than a
@@ -554,7 +658,6 @@ class SetupWizard(discord.ui.View):
             "Server setup",
             "Configure staff access below. **Nothing changes until you select Save setup.**\n\n"
             "Umask never creates roles or changes their permissions automatically.",
-            logo=True,
         )
         embed.add_field(name="1 · Permanent staff role",
                         value="Identifies who is allowed to authenticate. This role stays assigned **all the time**, but should **not** include the powers you're protecting.\n"
@@ -625,7 +728,6 @@ class SetupWizard(discord.ui.View):
             f"**Shutdown alerts:** {channel.mention if channel else 'Disabled'}\n\n"
             "Umask will **not** change role permissions for you. "
             "Remove protected powers from permanent roles, then use `/issue` to authorise staff.",
-            logo=True,
         )
         if changed:
             confirmation.add_field(name="Important: roles changed",
@@ -658,8 +760,9 @@ class SetupWizard(discord.ui.View):
                 pass
 
 
-@bot.tree.command(name="setup", description="Owner: configure Umask using a guided setup form")
+@bot.tree.command(name="setup", description="Configure the bot for this server.")
 @app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
 async def setup(interaction: discord.Interaction):
     if bot.maintenance_mode:
         return await reply(interaction, 'Umask is in maintenance mode. Setup changes are temporarily disabled.')
@@ -667,19 +770,16 @@ async def setup(interaction: discord.Interaction):
         return await reply(interaction, "Only the **server owner** can configure Umask.")
     cfg = bot.store.config(interaction.guild_id)
     view = SetupWizard(interaction.guild, interaction.user.id, cfg)
-    attachment = logo_attachment()
-    kwargs = {"embed": view.render(), "view": view, "ephemeral": True}
-    if attachment:
-        kwargs["file"] = attachment
-    await interaction.response.send_message(**kwargs)
+    await interaction.response.send_message(embed=view.render(), view=view, ephemeral=True)
     try:
         view.message = await interaction.original_response()
     except discord.HTTPException:
         pass
 
 
-@bot.tree.command(name="issue", description="Owner: issue or replace a 10-word staff credential")
+@bot.tree.command(name="issue", description="Issue a staff authentication code.")
 @app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
 async def issue(interaction: discord.Interaction, member: discord.Member):
     if bot.maintenance_mode:
         return await reply(interaction, 'Umask is in maintenance mode. New credentials cannot be issued.')
@@ -726,7 +826,7 @@ async def issue(interaction: discord.Interaction, member: discord.Member):
         secret=True, title="Credential issued")
 
 
-@bot.tree.command(name="receive", description="Staff: collect your newly issued phrase once")
+@bot.tree.command(name="receive", description="Collect your authentication code.")
 @app_commands.guild_only()
 async def receive(interaction: discord.Interaction):
     if bot.maintenance_mode:
@@ -757,7 +857,7 @@ async def receive(interaction: discord.Interaction):
         secret=True, title="Your authentication phrase")
 
 
-class AuthenticationModal(discord.ui.Modal, title="Umask — Authenticate"):
+class AuthenticationModal(discord.ui.Modal, title="Authenticate"):
     phrase = discord.ui.TextInput(label="Your 10-word authentication phrase",
                                   placeholder="Enter the ten words in order", style=discord.TextStyle.paragraph,
                                   min_length=10, max_length=160, required=True)
@@ -781,6 +881,14 @@ class AuthenticationModal(discord.ui.Modal, title="Umask — Authenticate"):
             allowed = parse_durations(cfg['durations'])
             if self.duration not in allowed:
                 return await reply(interaction, f"The owner permits: {', '.join(map(str, allowed))} minutes.")
+            # Recheck before evaluating the secret: staff could lose the role
+            # after opening the modal, or while the modal is sitting open.
+            try:
+                member = await bot.get_member(interaction.guild, uid)
+            except (discord.HTTPException, discord.Forbidden):
+                return await reply(interaction, "Could not verify your staff role. Try again shortly.")
+            if not member or cfg['staff_role_id'] not in {r.id for r in member.roles}:
+                return await reply(interaction, "You no longer have the permanent staff role.")
             cred = bot.store.credential(gid, uid)
             if not cred:
                 return await reply(interaction, "No credential exists for you. Ask the server owner.")
@@ -833,9 +941,9 @@ class AuthenticationModal(discord.ui.Modal, title="Umask — Authenticate"):
                     title="Session active")
 
 
-@bot.tree.command(name="authenticate", description="Staff: verify your phrase and request a timed active role")
+@bot.tree.command(name="authenticate", description="Sign in for temporary access.")
 @app_commands.guild_only()
-@app_commands.describe(duration_minutes="Allowed number of minutes; leave blank for server default")
+@app_commands.describe(duration_minutes="Session length in minutes (optional)")
 async def authenticate(interaction: discord.Interaction, duration_minutes: int | None = None):
     if bot._closing_gatekeeper or bot._shutdown_requested or bot.maintenance_mode:
         return await reply(interaction, "Umask is in maintenance or shutting down. New sessions are unavailable.")
@@ -848,12 +956,18 @@ async def authenticate(interaction: discord.Interaction, duration_minutes: int |
     duration = duration_minutes if duration_minutes is not None else (60 if 60 in allowed else allowed[0])
     if duration not in allowed:
         return await reply(interaction, f"Allowed durations: {', '.join(map(str, allowed))} minutes.")
+    try:
+        member = await bot.get_member(interaction.guild, interaction.user.id)
+    except (discord.HTTPException, discord.Forbidden):
+        return await reply(interaction, "Could not verify your staff role. Try again shortly.")
+    if not member or cfg['staff_role_id'] not in {r.id for r in member.roles}:
+        return await reply(interaction, "You do not have the permanent staff role required to authenticate.")
     if not bot.store.credential(interaction.guild_id, interaction.user.id):
         return await reply(interaction, "You have no staff credential. Ask the server owner to run `/issue`.")
     await interaction.response.send_modal(AuthenticationModal(duration))
 
 
-@bot.tree.command(name="signout", description="Staff: immediately relinquish your active permissions")
+@bot.tree.command(name="signout", description="End your session and remove access.")
 @app_commands.guild_only()
 async def signout(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True, thinking=True)
@@ -874,30 +988,83 @@ async def signout(interaction: discord.Interaction):
     await reply(interaction, "Elevated permissions removed.", title="Signed out")
 
 
-@bot.tree.command(name="revoke", description="Owner: invalidate someone's credential and remove any active role")
-@app_commands.guild_only()
-async def revoke(interaction: discord.Interaction, user: discord.User):
-    if not require_owner(interaction):
-        return await reply(interaction, "Only the server owner can revoke staff credentials.")
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    gid, uid = interaction.guild_id, user.id
+async def revoke_staff_credential(guild: discord.Guild, user_id: int) -> bool:
+    """Shared action for /revoke and confirmed owner DM button.
+
+    A False result means the credential was invalidated but Discord role
+    removal failed and the reconciler will retry any tracked session.
+    """
+    gid, uid = guild.id, user_id
     async with bot.lock(gid, uid):
-        # Fail closed immediately: even if Discord role removal fails, no login.
         bot.store.revoke_credential(gid, uid)
         session = bot.store.session(gid, uid)
         cfg = bot.store.config(gid)
         role_id = session['role_id'] if session else (cfg['elevated_role_id'] if cfg else None)
-        role = interaction.guild.get_role(role_id) if role_id else None
+        role = guild.get_role(role_id) if role_id else None
         try:
-            member = await bot.get_member(interaction.guild, uid)
+            member = await bot.get_member(guild, uid)
             if member and role and role.id in {r.id for r in member.roles}:
-                await member.remove_roles(role, reason="Umask: revoked by server owner")
-            bot.store.end_session(gid, uid, "owner_revoked")
+                await member.remove_roles(role, reason='Umask: revoked by server owner')
+            bot.store.end_session(gid, uid, 'owner_revoked')
         except (discord.Forbidden, discord.HTTPException):
             if session:
-                bot.store.force_expire(gid, uid, "owner_revoked")
-            return await reply(interaction, "Credential invalidated, but Discord refused role removal. **Remove the role manually.** The bot will retry if a session was tracked.")
-    await reply(interaction, f"Credential revoked for {safe_display_label(user.display_name, uid)}. "
+                bot.store.force_expire(gid, uid, 'owner_revoked')
+            return False
+    return True
+
+
+class StaffLossRevokeView(discord.ui.View):
+    """Owner DM action. Persistent across restarts while credential exists."""
+    def __init__(self, guild_id: int, user_id: int):
+        super().__init__(timeout=None)
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self.revoke_button.custom_id = f'umask:staffrev:{guild_id}:{user_id}'
+        self.keep_button.custom_id = f'umask:staffkeep:{guild_id}:{user_id}'
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        guild = bot.get_guild(self.guild_id)
+        if not guild or interaction.user.id != guild.owner_id:
+            await interaction.response.send_message('Only the current server owner can use this action.', ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label='Revoke code', style=discord.ButtonStyle.danger, custom_id='umask:staffrev:0:0')
+    async def revoke_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild = bot.get_guild(self.guild_id)
+        if guild is None:
+            return await interaction.edit_original_response(content='Bot is no longer in that server.')
+        try:
+            ok = await revoke_staff_credential(guild, self.user_id)
+            detail = ('Authentication code revoked. Any elevated role was removed if present.' if ok
+                      else 'Code revoked, but role removal failed. Remove the role manually; Umask will retry tracked sessions.')
+            await interaction.edit_original_response(content=detail)
+            # The DM must no longer invite repeated actions.
+            try:
+                await interaction.message.edit(view=None)
+            except (discord.HTTPException, discord.Forbidden):
+                pass
+        except Exception:
+            log.exception('Revoke DM action failed guild=%s user=%s', self.guild_id,self.user_id)
+            await interaction.edit_original_response(content='Could not complete revocation. Use `/revoke` in the server.')
+
+    @discord.ui.button(label='Keep code', style=discord.ButtonStyle.secondary, custom_id='umask:staffkeep:0:0')
+    async def keep_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(view=None)
+
+
+@bot.tree.command(name="revoke", description="Revoke a staff authentication code.")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def revoke(interaction: discord.Interaction, user: discord.User):
+    if not require_owner(interaction):
+        return await reply(interaction, "Only the server owner can revoke staff credentials.")
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    ok = await revoke_staff_credential(interaction.guild, user.id)
+    if not ok:
+        return await reply(interaction, "Code revoked, but role removal failed. Remove it manually; Umask will retry tracked sessions.")
+    await reply(interaction, f"Credential revoked for {safe_display_label(user.display_name, user.id)}. "
                 "Their tracked active role was removed if present.", title="Access revoked")
 
 
@@ -968,6 +1135,31 @@ def paginate_total(total: int, page: int, per_page: int = STATUS_PAGE_SIZE) -> t
     return max(1, min(page, pages)), pages
 
 
+def page_jump_options(page: int, pages: int) -> list[int]:
+    """Discord selects allow at most 25 options; preserve endpoints and context."""
+    if pages <= 25:
+        return list(range(1, pages + 1))
+    start = max(2, min(page - 10, pages - 22))
+    selection = {1, pages, *range(start, min(pages, start + 23))}
+    return sorted(selection)[:25]
+
+
+class StatusPageSelect(discord.ui.Select):
+    def __init__(self, owner_view: 'OwnerStatusView', pages: int):
+        self.owner_view = owner_view
+        options = [discord.SelectOption(label=f'Page {n}', value=str(n),
+                                        default=(n == owner_view.page))
+                   for n in page_jump_options(owner_view.page, pages)]
+        super().__init__(placeholder=f'Jump to page · {owner_view.page}/{pages}',
+                         options=options, row=2)
+
+    async def callback(self, interaction: discord.Interaction):
+        self.owner_view.page = int(self.values[0])
+        await interaction.response.defer()
+        await interaction.edit_original_response(
+            content=None, embed=await self.owner_view.render(), view=self.owner_view)
+
+
 class OwnerStatusView(discord.ui.View):
     def __init__(self, guild: discord.Guild, requester_id: int):
         super().__init__(timeout=300)
@@ -977,6 +1169,9 @@ class OwnerStatusView(discord.ui.View):
         self.section = "overview"
         self.page = 1
         self.message: discord.InteractionMessage | None = None
+        self._previous_button = next(c for c in self.children if getattr(c, 'custom_id', None) == 'umask:previous')
+        self._next_button = next(c for c in self.children if getattr(c, 'custom_id', None) == 'umask:next')
+        self._page_select: StatusPageSelect | None = None
         self._update_controls(1)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -989,17 +1184,27 @@ class OwnerStatusView(discord.ui.View):
         return True
 
     def _update_controls(self, pages: int) -> None:
+        # Hide navigation completely for a single page.
+        show_pages = self.section != 'overview' and pages > 1
+        for item in (self._previous_button, self._next_button):
+            if show_pages and item not in self.children:
+                self.add_item(item)
+            elif not show_pages and item in self.children:
+                self.remove_item(item)
+        self._previous_button.disabled = self.page <= 1
+        self._next_button.disabled = self.page >= pages
+        if self._page_select and self._page_select in self.children:
+            self.remove_item(self._page_select)
+        self._page_select = None
+        if show_pages and pages >= 5:
+            self._page_select = StatusPageSelect(self, pages)
+            self.add_item(self._page_select)
         for component in self.children:
-            if isinstance(component, discord.ui.Button):
-                if component.custom_id == "umask:previous":
-                    component.disabled = self.section == "overview" or self.page <= 1
-                elif component.custom_id == "umask:next":
-                    component.disabled = self.section == "overview" or self.page >= pages
-                elif component.custom_id.startswith("umask:tab:"):
-                    current = component.custom_id.rsplit(":", 1)[1]
-                    component.style = (discord.ButtonStyle.primary if current == self.section
-                                       else discord.ButtonStyle.secondary)
-                    component.disabled = current == self.section
+            if isinstance(component, discord.ui.Button) and component.custom_id.startswith('umask:tab:'):
+                current = component.custom_id.rsplit(':', 1)[1]
+                component.style = (discord.ButtonStyle.primary if current == self.section
+                                   else discord.ButtonStyle.secondary)
+                component.disabled = current == self.section
 
     async def _labels(self, user_ids) -> dict[int, str]:
         ids = sorted(set(int(uid) for uid in user_ids))
@@ -1014,7 +1219,7 @@ class OwnerStatusView(discord.ui.View):
             self.section = "overview"
             self.page = 1
             self._update_controls(1)
-            e = brand_embed("Server overview", "Not configured yet. Run `/setup` to start.", logo=True)
+            e = brand_embed("Server overview", "Not configured yet. Run `/setup` to start.")
             e.set_footer(text="Owner-only dashboard · private to you")
             return e
         if self.section == "overview":
@@ -1022,7 +1227,7 @@ class OwnerStatusView(discord.ui.View):
             active = bot.store.count_sessions(gid)
             credentials = bot.store.count_credentials(gid)
             completed = bot.store.count_history(gid)
-            e = brand_embed("Server overview", "Staff access and authentication activity at a glance.", logo=True)
+            e = brand_embed("Server overview", "Staff access and authentication activity at a glance.")
             e.add_field(name="Issued credentials", value=f"**{credentials}**", inline=True)
             e.add_field(name="Tracked sessions", value=f"**{active}**", inline=True)
             e.add_field(name="Completed sessions", value=f"**{completed}**", inline=True)
@@ -1056,14 +1261,19 @@ class OwnerStatusView(discord.ui.View):
             entries = bot.store.credentials_for_guild(gid, STATUS_PAGE_SIZE,
                                                        (self.page - 1) * STATUS_PAGE_SIZE)
             e = brand_embed("Issued credentials",
-                            "Staff authorised to sign in. **Secret phrases and hashes are never displayed.**",
-                            logo=True)
+                            "Staff authorised to sign in. **Secret phrases and hashes are never displayed.**")
             if entries:
                 labels = await self._labels(r['user_id'] for r in entries)
                 for r in entries:
-                    e.add_field(name=labels[r['user_id']],
-                                value=(f"Issued <t:{r['issued_at']}:f>\n{credential_state(r, now)}"),
-                                inline=False)
+                    notes = []
+                    if r['staff_missing_since'] is not None:
+                        notes.append(f"⚠ Staff role absent since <t:{r['staff_missing_since']}:R>")
+                    if r['permission_warning_key']:
+                        notes.append("⚠ Member has Administrator or Manage Roles through another role")
+                    detail = f"Issued <t:{r['issued_at']}:f>\n{credential_state(r, now)}"
+                    if notes:
+                        detail += '\n' + '\n'.join(notes)
+                    e.add_field(name=labels[r['user_id']], value=detail, inline=False)
             else:
                 e.description += "\n\nNo credentials issued. Use `/issue` to authorise staff."
             e.set_footer(text=f"{total} issued · Page {self.page}/{pages} · Owner only")
@@ -1072,7 +1282,7 @@ class OwnerStatusView(discord.ui.View):
             self.page, pages = paginate_total(total, self.page)
             entries = bot.store.sessions_for_guild(gid, STATUS_PAGE_SIZE,
                                                     (self.page - 1) * STATUS_PAGE_SIZE)
-            e = brand_embed("Active sessions", "Includes sessions awaiting role removal.", logo=True)
+            e = brand_embed("Active sessions", "Includes sessions awaiting role removal.")
             if entries:
                 labels = await self._labels(r['user_id'] for r in entries)
                 for r in entries:
@@ -1094,7 +1304,7 @@ class OwnerStatusView(discord.ui.View):
             self.page, pages = paginate_total(total, self.page)
             entries = bot.store.history_for_guild(gid, STATUS_PAGE_SIZE,
                                                    (self.page - 1) * STATUS_PAGE_SIZE)
-            e = brand_embed("Session history", "Completed sessions and how they ended.", logo=True)
+            e = brand_embed("Session history", "Completed sessions and how they ended.")
             if entries:
                 labels = await self._labels(r['user_id'] for r in entries)
                 for r in entries:
@@ -1135,14 +1345,14 @@ class OwnerStatusView(discord.ui.View):
     async def history_tab(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.switch(interaction, "history")
 
-    @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary,
+    @discord.ui.button(label="‹", style=discord.ButtonStyle.secondary,
                        row=1, custom_id="umask:previous")
     async def previous(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.page = max(1, self.page - 1)
         await interaction.response.defer()
         await interaction.edit_original_response(content=None, embed=await self.render(), view=self)
 
-    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary,
+    @discord.ui.button(label="›", style=discord.ButtonStyle.secondary,
                        row=1, custom_id="umask:next")
     async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.page += 1
@@ -1468,16 +1678,14 @@ class OperatorStatusView(discord.ui.View):
                 pass
 
 
-@bot.tree.command(name="status", description="Your access, or the owner's private server dashboard")
+@bot.tree.command(name="status", description="View access and session status.")
 @app_commands.guild_only()
 async def status(interaction: discord.Interaction):
     if await bot.is_owner(interaction.user):
         view = OperatorStatusView(interaction.guild, interaction.user.id)
         await interaction.response.defer(ephemeral=True, thinking=True)
-        attachment = logo_attachment()
         await interaction.edit_original_response(
-            embed=await view.render(), view=view,
-            attachments=[attachment] if attachment else [])
+            embed=await view.render(), view=view, attachments=[])
         try:
             view.message = await interaction.original_response()
         except discord.HTTPException:
@@ -1488,9 +1696,8 @@ async def status(interaction: discord.Interaction):
         view = OwnerStatusView(interaction.guild, interaction.user.id)
         await interaction.response.defer(ephemeral=True, thinking=True)
         e = await view.render()
-        attachment = logo_attachment()
         await interaction.edit_original_response(
-            embed=e, view=view, attachments=[attachment] if attachment else [])
+            embed=e, view=view, attachments=[])
         try:
             view.message = await interaction.original_response()
         except discord.HTTPException:
@@ -1498,6 +1705,12 @@ async def status(interaction: discord.Interaction):
         return
     if not cfg:
         return await reply(interaction, "This server has not configured Umask yet. Ask its owner to run `/setup`.")
+    try:
+        member = await bot.get_member(interaction.guild, interaction.user.id)
+    except (discord.HTTPException, discord.Forbidden):
+        return await reply(interaction, "Could not verify your staff role. Try again shortly.")
+    if not member or cfg['staff_role_id'] not in {r.id for r in member.roles}:
+        return await reply(interaction, "You do not have the permanent staff role needed to use Umask here.")
     sess = bot.store.session(interaction.guild_id, interaction.user.id)
     credential = bot.store.credential(interaction.guild_id, interaction.user.id)
     role = interaction.guild.get_role(cfg['elevated_role_id'])
@@ -1522,8 +1735,14 @@ async def status(interaction: discord.Interaction):
 
 @bot.tree.error
 async def command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    # Never print command inputs: future commands may include secrets.
-    log.error("Command error in guild=%s user=%s type=%s", interaction.guild_id, interaction.user.id, type(error).__name__)
+    # Log exception *types* and stack locations, never exception messages,
+    # command arguments or traceback locals (which may include secret phrases).
+    cause = getattr(error, 'original', None) or error.__cause__ or error
+    frames = traceback.extract_tb(cause.__traceback__) if cause.__traceback__ else []
+    locations = ' -> '.join(f'{Path(f.filename).name}:{f.lineno}:{f.name}' for f in frames[-12:])
+    log.error('Command error in guild=%s user=%s type=%s cause=%s locations=%s',
+              interaction.guild_id, interaction.user.id, type(error).__name__,
+              type(cause).__name__, locations or 'unavailable')
     try:
         await reply(interaction, "Something went wrong. No successful permission change was confirmed. Check the bot logs and use `/status`.")
     except discord.HTTPException:

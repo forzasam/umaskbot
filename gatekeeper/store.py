@@ -57,6 +57,15 @@ class Store:
         credential_columns = {row['name'] for row in self.conn.execute("PRAGMA table_info(credentials)")}
         if 'collected_at' not in credential_columns:
             self.conn.execute("ALTER TABLE credentials ADD COLUMN collected_at INTEGER")
+        # Versioned, credential-scoped monitoring state is deleted automatically
+        # when credentials are revoked or erased. No extra member-list intent.
+        for column, ddl in (
+            ('staff_missing_since', 'INTEGER'),
+            ('staff_loss_notified_at', 'INTEGER'),
+            ('permission_warning_key', 'TEXT'),
+        ):
+            if column not in credential_columns:
+                self.conn.execute(f"ALTER TABLE credentials ADD COLUMN {column} {ddl}")
         history_columns = {r['name'] for r in self.conn.execute("PRAGMA table_info(session_history)")}
         if 'hold_until' not in history_columns:
             self.conn.execute("ALTER TABLE session_history ADD COLUMN hold_until INTEGER")
@@ -129,7 +138,7 @@ class Store:
         """Read-only owner inventory. Never SELECT phrase hashes or escrow ciphertext."""
         return self.conn.execute("""SELECT user_id, issued_at, pending_until,
                  CASE WHEN pending_secret IS NOT NULL THEN 1 ELSE 0 END AS has_pending_copy,
-                 collected_at
+                 collected_at, staff_missing_since, staff_loss_notified_at, permission_warning_key
             FROM credentials WHERE guild_id=?
             ORDER BY issued_at DESC, user_id ASC LIMIT ? OFFSET ?""",
             (guild_id, limit, offset)
@@ -142,8 +151,25 @@ class Store:
               VALUES (?,?,?,?,?,?,0,0,0) ON CONFLICT(guild_id,user_id) DO UPDATE SET
               phrase_hash=excluded.phrase_hash,pending_secret=excluded.pending_secret,
               pending_until=excluded.pending_until,issued_at=excluded.issued_at,
-              collected_at=0,attempts=0,locked_until=0""",
+              collected_at=0,attempts=0,locked_until=0,
+              staff_missing_since=NULL,staff_loss_notified_at=NULL,
+              permission_warning_key=NULL""",
               (guild_id,user_id,hash_value,encrypted,valid_until,int(time.time())))
+
+    def monitor_credential_batch(self, limit: int = 40, offset: int = 0):
+        """Bounded scan of credential holders, never all guild members."""
+        return self.conn.execute('''SELECT guild_id,user_id,staff_missing_since,
+                staff_loss_notified_at,permission_warning_key FROM credentials
+                ORDER BY guild_id,user_id LIMIT ? OFFSET ?''', (limit,offset)).fetchall()
+
+    def mark_staff_role_state(self, guild_id: int, user_id: int,
+                              missing_since: int | None, notified_at: int | None):
+        self.conn.execute('''UPDATE credentials SET staff_missing_since=?,staff_loss_notified_at=?
+            WHERE guild_id=? AND user_id=?''', (missing_since,notified_at,guild_id,user_id))
+
+    def mark_permission_warning(self, guild_id: int, user_id: int, warning_key: str | None):
+        self.conn.execute('''UPDATE credentials SET permission_warning_key=?
+            WHERE guild_id=? AND user_id=?''', (warning_key,guild_id,user_id))
 
     def consume_pending(self, guild_id, user_id, now):
         # Atomic one-time reveal: a failure while sending cannot be retried.

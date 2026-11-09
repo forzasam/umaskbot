@@ -64,6 +64,9 @@ class MySQLStore:
                 attempts INT NOT NULL DEFAULT 0,
                 locked_until BIGINT NOT NULL DEFAULT 0,
                 collected_at BIGINT NULL,
+                staff_missing_since BIGINT NULL,
+                staff_loss_notified_at BIGINT NULL,
+                permission_warning_key VARCHAR(512) NULL,
                 PRIMARY KEY (guild_id, user_id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4''',
             '''CREATE TABLE IF NOT EXISTS sessions (
@@ -105,6 +108,15 @@ class MySQLStore:
                     cur.execute('ALTER TABLE session_history ADD COLUMN hold_until BIGINT NULL')
                 if 'hold_reference' not in fields:
                     cur.execute('ALTER TABLE session_history ADD COLUMN hold_reference VARCHAR(64) NULL')
+                cur.execute('SHOW COLUMNS FROM credentials')
+                cred_fields = {r['Field'] for r in cur.fetchall()}
+                for col, ddl in (
+                    ('staff_missing_since', 'BIGINT NULL'),
+                    ('staff_loss_notified_at', 'BIGINT NULL'),
+                    ('permission_warning_key', 'VARCHAR(512) NULL'),
+                ):
+                    if col not in cred_fields:
+                        cur.execute(f'ALTER TABLE credentials ADD COLUMN {col} {ddl}')
 
     @contextmanager
     def tx(self):
@@ -197,7 +209,7 @@ class MySQLStore:
         # Do not expose either verifier hashes or escrow ciphertext in dashboard queries.
         return self._all('''SELECT user_id, issued_at, pending_until,
                  CASE WHEN pending_secret IS NOT NULL THEN 1 ELSE 0 END AS has_pending_copy,
-                 collected_at FROM credentials WHERE guild_id=%s
+                 collected_at, staff_missing_since, staff_loss_notified_at, permission_warning_key FROM credentials WHERE guild_id=%s
                  ORDER BY issued_at DESC, user_id ASC LIMIT %s OFFSET %s''',
                          (guild_id,int(limit),int(offset)))
 
@@ -208,8 +220,24 @@ class MySQLStore:
               VALUES (%s,%s,%s,%s,%s,%s,0,0,0)
               ON DUPLICATE KEY UPDATE phrase_hash=VALUES(phrase_hash),
               pending_secret=VALUES(pending_secret),pending_until=VALUES(pending_until),
-              issued_at=VALUES(issued_at),attempts=0,locked_until=0,collected_at=0''',
+              issued_at=VALUES(issued_at),attempts=0,locked_until=0,collected_at=0,
+              staff_missing_since=NULL,staff_loss_notified_at=NULL,permission_warning_key=NULL''',
                         (guild_id,user_id,hash_value,encrypted,valid_until,int(time.time())))
+
+    def monitor_credential_batch(self, limit: int = 40, offset: int = 0):
+        return self._all('''SELECT guild_id,user_id,staff_missing_since,
+            staff_loss_notified_at,permission_warning_key FROM credentials
+            ORDER BY guild_id,user_id LIMIT %s OFFSET %s''', (int(limit),int(offset)))
+
+    def mark_staff_role_state(self, guild_id: int, user_id: int,
+                              missing_since: int | None, notified_at: int | None):
+        self._write('''UPDATE credentials SET staff_missing_since=%s,staff_loss_notified_at=%s
+            WHERE guild_id=%s AND user_id=%s''',
+            (missing_since,notified_at,guild_id,user_id))
+
+    def mark_permission_warning(self, guild_id: int, user_id: int, warning_key: str | None):
+        self._write('''UPDATE credentials SET permission_warning_key=%s
+            WHERE guild_id=%s AND user_id=%s''', (warning_key,guild_id,user_id))
 
     def consume_pending(self, guild_id, user_id, now):
         with self.tx() as cur:

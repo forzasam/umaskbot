@@ -7,6 +7,9 @@
 
 # Database files
 data/
+backups/
+private/
+
 *.sqlite
 *.sqlite3
 *.db
