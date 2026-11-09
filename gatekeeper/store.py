@@ -82,6 +82,9 @@ class Store:
     def config(self, guild_id):
         return self.conn.execute("SELECT * FROM guild_config WHERE guild_id=?", (guild_id,)).fetchone()
 
+    def configured_guild_ids(self) -> set[int]:
+        return {int(row[0]) for row in self.conn.execute('SELECT guild_id FROM guild_config')}
+
     def set_config(self, guild_id, staff_role_id, elevated_role_id, durations, alert_channel_id):
         existing = self.config(guild_id)
         change = bool(existing and (existing['staff_role_id'] != staff_role_id or existing['elevated_role_id'] != elevated_role_id))

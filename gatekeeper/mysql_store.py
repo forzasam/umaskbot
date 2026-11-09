@@ -146,6 +146,9 @@ class MySQLStore:
     def config(self, guild_id):
         return self._one('SELECT * FROM guild_config WHERE guild_id=%s', (guild_id,))
 
+    def configured_guild_ids(self) -> set[int]:
+        return {int(row['guild_id']) for row in self._all('SELECT guild_id FROM guild_config')}
+
     def set_config(self, guild_id, staff_role_id, elevated_role_id, durations, alert_channel_id):
         with self.tx() as cur:
             cur.execute('SELECT * FROM guild_config WHERE guild_id=%s FOR UPDATE', (guild_id,))

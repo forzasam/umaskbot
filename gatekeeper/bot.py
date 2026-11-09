@@ -18,6 +18,7 @@ from .store import Store
 from .mysql_store import MySQLStore
 from .privacy import PrivacyLedger, backup_sqlite
 from .privacy_ops import register_privacy_ops
+from .operator_state import MaintenanceState, human_uptime, support_invite, maintenance_announcement
 
 log = logging.getLogger("gatekeeper")
 load_dotenv()
@@ -114,6 +115,13 @@ class Umask(commands.Bot):
         self._closing_gatekeeper = False
         self._shutdown_requested = False
         self.shutdown_lock = asyncio.Lock()
+        self.process_started = time.monotonic()
+        self.last_reconciliation_at: int | None = None
+        self.last_maintenance_at: int | None = None
+        self.maintenance_state = MaintenanceState(
+            os.getenv('MAINTENANCE_STATE_PATH', './private/maintenance.json'),
+            require_existing=os.getenv('MAINTENANCE_REQUIRE_EXISTING', '0') == '1')
+        self.maintenance_mode = self.maintenance_state.enabled
 
     async def setup_hook(self):
         dev_guild = os.environ.get("DEV_GUILD_ID")
@@ -213,9 +221,12 @@ class Umask(commands.Bot):
             self.privacy_ledger.apply(self.store, now=now)
             self.store.purge_pending(now)
             for row in self.store.all_sessions():
+                if self.maintenance_mode and not row['termination_reason']:
+                    self.store.force_expire(row['guild_id'], row['user_id'], 'operator_maintenance')
                 await self.reconcile_one(row['guild_id'], row['user_id'], now)
             # Role revocation may have just created a final history row.
             self.privacy_ledger.apply(self.store, now=now)
+            self.last_reconciliation_at = int(time.time())
 
     async def reconcile_one(self, guild_id: int, user_id: int, now: int | None = None):
         now = int(time.time()) if now is None else now
@@ -291,6 +302,7 @@ class Umask(commands.Bot):
                 log.info('Daily SQLite snapshot verified: %s', snapshot.name)
             else:
                 log.warning('MySQL selected: built-in SQLite snapshots unavailable; configure provider backups')
+            self.last_maintenance_at = int(time.time())
             log.info('Maintenance completed; expired history=%s cleared departed servers=%s',
                      removed, departed_removed)
         except Exception:
@@ -300,26 +312,80 @@ class Umask(commands.Bot):
     async def before_maintenance(self):
         await self.wait_until_ready()
 
-    async def _drain_roles(self):
-        # Best effort graceful shutdown: revoke before stopping. Not a guarantee
-        # under SIGKILL, power outage, service crash, or Discord API outage.
-        active_guilds = set()
-        for row in self.store.all_sessions():
-            gid, uid = row['guild_id'], row['user_id']
-            active_guilds.add(gid)
-            self.store.force_expire(gid, uid, "bot_shutdown")
-            await self.reconcile_one(gid, uid)
-        for gid in active_guilds:
-            guild = self.get_guild(gid)
-            cfg = self.store.config(gid)
-            if not guild or not cfg:
-                continue
-            channel = guild.get_channel(cfg['alert_channel_id']) if cfg['alert_channel_id'] else None
-            if channel:
-                try:
-                    await channel.send("Umask is shutting down for maintenance. Active staff sessions have been requested for revocation; check any remaining roles manually if Discord was unreachable.", allowed_mentions=discord.AllowedMentions.none())
-                except discord.HTTPException:
-                    log.warning("Could not send shutdown notice in guild=%s", gid)
+    async def _drain_roles(self, reason: str = 'bot_shutdown') -> tuple[int, int]:
+        """Mark all tracked grants for removal and attempt each Discord revocation.
+
+        The DB records remain until an API-confirmed removal. This method never
+        sends community notices: only an operator-confirmed maintenance event
+        sends a notice, avoiding announcements on ordinary PebbleHost restarts.
+        """
+        records = list(self.store.all_sessions())
+        for row in records:
+            self.store.force_expire(row['guild_id'], row['user_id'], reason)
+        for row in records:
+            try:
+                await self.reconcile_one(row['guild_id'], row['user_id'])
+            except Exception:
+                log.exception('Could not reconcile a role during %s guild=%s user=%s',
+                              reason, row['guild_id'], row['user_id'])
+        return len(records), len(self.store.all_sessions())
+
+    async def prepare_maintenance(self, custom_message: str) -> dict[str, int]:
+        """Persist the deny-new-sessions gate BEFORE scanning or notifying.
+
+        The shutdown_lock also serialises grants in AuthenticationModal. Never
+        await per-user locks while holding it (would deadlock with auth).
+        """
+        async with self.shutdown_lock:
+            if self.maintenance_mode or self._closing_gatekeeper:
+                raise ValueError('Umask is already in maintenance mode or stopping.')
+            self.maintenance_state.activate()
+            self.maintenance_mode = True
+        log.warning('Operator activated persistent maintenance mode')
+        try:
+            _, outstanding = await self._drain_roles('operator_maintenance')
+        except Exception:
+            log.exception('Maintenance role drain encountered a database failure')
+            outstanding = -1
+        notices_sent = notices_failed = 0
+        # Announce to EVERY configured and currently accessible guild, not just
+        # those with an active staff session. Never impersonate its owner.
+        for guild in list(self.guilds):
+            try:
+                cfg = self.store.config(guild.id)
+                channel_id = cfg['alert_channel_id'] if cfg else None
+                channel = guild.get_channel(channel_id) if channel_id else None
+                if not channel_id:
+                    continue
+                if not isinstance(channel, discord.TextChannel):
+                    notices_failed += 1
+                    continue
+                text = maintenance_announcement(discord.utils.escape_mentions(custom_message),
+                    outstanding=max(0, outstanding))
+                if outstanding < 0:
+                    text += ('\n**Warning:** Session-revocation status could not be verified '
+                             'because of a storage error.')
+                await channel.send(text, allowed_mentions=discord.AllowedMentions.none())
+                notices_sent += 1
+            except (discord.HTTPException, discord.Forbidden):
+                notices_failed += 1
+                log.warning('Could not deliver maintenance notice guild=%s', guild.id)
+            except Exception:
+                notices_failed += 1
+                log.exception('Unexpected failure sending maintenance notice guild=%s', guild.id)
+        return {'pending': outstanding, 'sent': notices_sent, 'failed': notices_failed}
+
+    async def resume_from_maintenance(self) -> None:
+        async with self.shutdown_lock:
+            if not self.maintenance_mode:
+                return
+            # A tracked grant that could not be revoked must not become active
+            # again when maintenance ends. Remaining rows need manual action.
+            if self.store.all_sessions():
+                raise ValueError('Tracked elevated roles still need cleanup. Check and remove them before resuming.')
+            self.maintenance_state.deactivate()
+            self.maintenance_mode = False
+        log.warning('Operator manually resumed Umask from maintenance mode')
 
     async def close(self):
         if not self._closing_gatekeeper:
@@ -358,92 +424,15 @@ def require_owner(interaction: discord.Interaction) -> bool:
     return interaction.guild is not None and interaction.user.id == interaction.guild.owner_id
 
 
-class ShutdownConfirmation(discord.ui.View):
-    """Short-lived, requester-bound confirmation for bot-owner shutdown."""
-
-    def __init__(self, requester_id: int):
-        super().__init__(timeout=45)
-        self.requester_id = requester_id
-        self.message: discord.InteractionMessage | None = None
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        # A button interaction must never authorise another Discord account.
-        if interaction.user.id != self.requester_id or not await bot.is_owner(interaction.user):
-            await interaction.response.send_message(
-                "Only the bot owner who requested this shutdown can confirm it.", ephemeral=True
-            )
-            return False
-        return True
-
-    @discord.ui.button(label="Confirm shutdown", style=discord.ButtonStyle.danger)
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        async with bot.shutdown_lock:
-            if bot._closing_gatekeeper or bot._shutdown_requested:
-                await interaction.response.edit_message(
-                    content=None, embed=brand_embed("Shutdown in progress", "Umask is already stopping."), view=None
-                )
-                self.stop()
-                return
-            bot._shutdown_requested = True
-            try:
-                # Acknowledge BEFORE closing the connection. Keep the current
-                # task alive until close() finishes draining the active roles.
-                await interaction.response.edit_message(
-                    content=None,
-                    embed=brand_embed("Shutdown confirmed", "Revoking tracked elevated roles and disconnecting. "
-                                      "Check the console for any roles Discord could not remove.", accent="warning"),
-                    view=None,
-                )
-            except Exception:
-                bot._shutdown_requested = False
-                raise
-        self.stop()
-        log.warning("Application owner %s requested a graceful shutdown in guild %s",
-                    interaction.user.id, interaction.guild_id)
-        await bot.close()
-
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.stop()
-        await interaction.response.edit_message(
-            content=None, embed=brand_embed("Shutdown cancelled", "Umask is still running."), view=None
-        )
-
-    async def on_timeout(self):
-        if self.message is not None:
-            try:
-                await self.message.edit(
-                    content=None, embed=brand_embed("Confirmation expired", "Umask is still running."),
-                    view=None,
-                )
-            except discord.HTTPException:
-                pass
-
-
-@bot.tree.command(name="shutdown", description="Bot owner: revoke elevated sessions and stop Umask")
-@app_commands.guild_only()
-async def shutdown(interaction: discord.Interaction):
-    # This is the APPLICATION owner (or an authorised owner of a team-owned
-    # application), not merely the owner of the current Discord server.
-    if not await bot.is_owner(interaction.user):
-        return await reply(interaction, "Only the **Discord application owner** can shut down Umask.")
-    if bot._closing_gatekeeper or bot._shutdown_requested:
-        return await reply(interaction, "Umask is already shutting down.")
-    view = ShutdownConfirmation(interaction.user.id)
-    await interaction.response.send_message(
-        embed=brand_embed("Confirm global shutdown",
-                          "This attempts to remove **all tracked elevated roles** across all servers, "
-                          "records completed sessions, and disconnects Umask. "
-                          "If Discord rejects a role removal, it may remain until the next startup.\n\n"
-                          "Only the application owner can confirm. This prompt expires after 45 seconds.",
-                          accent="warning"),
-        ephemeral=True, view=view,
-    )
-    try:
-        view.message = await interaction.original_response()
-    except discord.HTTPException:
-        # Confirmation still functions if fetching the response fails.
-        pass
+@bot.tree.command(name="support", description="Get Umask's support server and contact email")
+async def support(interaction: discord.Interaction):
+    url = support_invite(os.getenv('SUPPORT_SERVER_URL', ''))
+    e = brand_embed('Support', 'Need help setting up Umask or reporting an issue?')
+    e.add_field(name='Support email', value='support@umask.app', inline=False)
+    e.add_field(name='Support server',
+                value=f'[Join the Umask support server]({url})' if url else
+                'Invite link not configured yet. Email us for an invite.', inline=False)
+    await interaction.response.send_message(embed=e, ephemeral=True)
 
 
 # The setup wizard deliberately uses a standard ephemeral View rather than a
@@ -593,8 +582,8 @@ class SetupWizard(discord.ui.View):
     async def save(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()  # Defer the message update during API permission checks.
         try:
-            if bot._closing_gatekeeper or bot._shutdown_requested:
-                raise ValueError("Umask is shutting down; try again after it restarts.")
+            if bot._closing_gatekeeper or bot._shutdown_requested or bot.maintenance_mode:
+                raise ValueError("Umask is in maintenance; setup changes are unavailable until the operator resumes service.")
             guild = interaction.guild
             if guild is None:
                 raise ValueError("This setup form is available only inside a server.")
@@ -672,6 +661,8 @@ class SetupWizard(discord.ui.View):
 @bot.tree.command(name="setup", description="Owner: configure Umask using a guided setup form")
 @app_commands.guild_only()
 async def setup(interaction: discord.Interaction):
+    if bot.maintenance_mode:
+        return await reply(interaction, 'Umask is in maintenance mode. Setup changes are temporarily disabled.')
     if not require_owner(interaction):
         return await reply(interaction, "Only the **server owner** can configure Umask.")
     cfg = bot.store.config(interaction.guild_id)
@@ -690,6 +681,8 @@ async def setup(interaction: discord.Interaction):
 @bot.tree.command(name="issue", description="Owner: issue or replace a 10-word staff credential")
 @app_commands.guild_only()
 async def issue(interaction: discord.Interaction, member: discord.Member):
+    if bot.maintenance_mode:
+        return await reply(interaction, 'Umask is in maintenance mode. New credentials cannot be issued.')
     if not require_owner(interaction):
         return await reply(interaction, "Only the server owner can issue credentials.")
     await interaction.response.defer(ephemeral=True, thinking=True)
@@ -717,7 +710,10 @@ async def issue(interaction: discord.Interaction, member: discord.Member):
             phrase = generate_phrase()
             digest = await asyncio.to_thread(hash_phrase, phrase)
             cipher = bot.fernet.encrypt(phrase.encode('utf-8'))
-            bot.store.issue(interaction.guild_id, member.id, digest, cipher, int(time.time())+900)
+            async with bot.shutdown_lock:
+                if bot.maintenance_mode or bot._closing_gatekeeper or bot._shutdown_requested:
+                    raise ValueError('Umask entered maintenance while issuing this credential. No credential was issued.')
+                bot.store.issue(interaction.guild_id, member.id, digest, cipher, int(time.time())+900)
         except (ValueError, discord.HTTPException) as e:
             return await reply(interaction, f"Cannot issue credential: {e}")
     await reply(interaction,
@@ -733,6 +729,8 @@ async def issue(interaction: discord.Interaction, member: discord.Member):
 @bot.tree.command(name="receive", description="Staff: collect your newly issued phrase once")
 @app_commands.guild_only()
 async def receive(interaction: discord.Interaction):
+    if bot.maintenance_mode:
+        return await reply(interaction, 'Umask is in maintenance mode. Credential collection is temporarily disabled.')
     async with bot.lock(interaction.guild_id, interaction.user.id):
         cfg = bot.store.config(interaction.guild_id)
         if not cfg:
@@ -812,11 +810,11 @@ class AuthenticationModal(discord.ui.Modal, title="Umask — Authenticate"):
                 if role.id in {r.id for r in member.roles}:
                     raise ValueError("Your active role is already assigned outside a tracked session. Ask the owner to investigate.")
                 expiry = now + self.duration * 60
-                # Serialise the actual role grant with /shutdown confirmation.
-                # Otherwise a grant could finish AFTER shutdown's role scan.
+                # Serialise role grants with the persistent maintenance gate.
+                # Otherwise a grant could finish after maintenance scans sessions.
                 async with bot.shutdown_lock:
-                    if bot._closing_gatekeeper or bot._shutdown_requested:
-                        raise ValueError("Umask is shutting down. New sessions are unavailable.")
+                    if bot._closing_gatekeeper or bot._shutdown_requested or bot.maintenance_mode:
+                        raise ValueError("Umask is in maintenance or shutting down. New sessions are unavailable.")
                     # Persist BEFORE granting, so a crash leaves a record to reconcile.
                     bot.store.put_session(gid, uid, role.id, expiry, now, 'granting')
                     try:
@@ -839,8 +837,8 @@ class AuthenticationModal(discord.ui.Modal, title="Umask — Authenticate"):
 @app_commands.guild_only()
 @app_commands.describe(duration_minutes="Allowed number of minutes; leave blank for server default")
 async def authenticate(interaction: discord.Interaction, duration_minutes: int | None = None):
-    if bot._closing_gatekeeper or bot._shutdown_requested:
-        return await reply(interaction, "Umask is shutting down. New sessions are unavailable.")
+    if bot._closing_gatekeeper or bot._shutdown_requested or bot.maintenance_mode:
+        return await reply(interaction, "Umask is in maintenance or shutting down. New sessions are unavailable.")
     cfg = bot.store.config(interaction.guild_id)
     if not cfg:
         return await reply(interaction, "Umask is not configured on this server.")
@@ -910,6 +908,7 @@ HISTORY_REASONS = {
     "signed_out": "Signed out",
     "owner_revoked": "Owner revoked",
     "bot_shutdown": "Bot shutdown",
+    "operator_maintenance": "Operator maintenance",
     "staff_access_removed": "Staff role removed",
     "unsafe_role": "Unsafe role configuration",
     "role_deleted": "Elevated role deleted",
@@ -1201,9 +1200,289 @@ def credential_state(row, now: int, *, personal: bool = False) -> str:
             if personal else "Collection status unknown · older credential")
 
 
+
+# Discord application owner only. Every interaction including modals and
+# confirmation buttons checks the invoker's identity again; buttons are not
+# trusted merely because they originated in an ephemeral message.
+class GuildOwnershipModal(discord.ui.Modal, title='Verify Discord server owner'):
+    guild_id_text = discord.ui.TextInput(label='Server ID', placeholder='Discord guild ID', max_length=20)
+    owner_id_text = discord.ui.TextInput(label='User ID to check', placeholder='Discord user ID', max_length=20)
+
+    def __init__(self, requester_id: int):
+        super().__init__(timeout=180)
+        self.requester_id = requester_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.user.id != self.requester_id or not await bot.is_owner(interaction.user):
+            return await reply(interaction, 'Only the Discord application owner may verify guild ownership.')
+        try:
+            gid = int(str(self.guild_id_text.value).strip())
+            uid = int(str(self.owner_id_text.value).strip())
+            if gid <= 0 or uid <= 0:
+                raise ValueError()
+        except ValueError:
+            return await reply(interaction, 'Enter valid numeric Discord server and user IDs.')
+        guild = bot.get_guild(gid)
+        if guild is None:
+            return await reply(interaction, 'Umask is not currently in that server (or it is not available in the bot cache).', title='Ownership check')
+        match = guild.owner_id == uid
+        e = brand_embed('Ownership check',
+                        f'Server: **{discord.utils.escape_markdown(discord.utils.escape_mentions(guild.name))}** (`{gid}`)\n'
+                        f'User ID: `{uid}`\n\n'
+                        + ('**Match — this is the server owner.**' if match else '**Not a match — that user is not the server owner.**'),
+                        accent='primary' if match else 'warning')
+        await interaction.response.send_message(embed=e, ephemeral=True)
+
+
+class MaintenanceConfirmation(discord.ui.View):
+    def __init__(self, requester_id: int, custom_message: str):
+        super().__init__(timeout=60)
+        self.requester_id = requester_id
+        self.custom_message = custom_message
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester_id or not await bot.is_owner(interaction.user):
+            await interaction.response.send_message('This confirmation is restricted to the application owner.', ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label='Confirm maintenance', style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            result = await bot.prepare_maintenance(self.custom_message)
+            pending = ('Could not verify; check storage and role assignments.' if result['pending'] < 0
+                       else str(result['pending']))
+            e = brand_embed('Maintenance enabled',
+                'New elevations are blocked, including after a PebbleHost restart.\n'
+                f'Tracked sessions still needing confirmation: **{pending}**\n'
+                f'Server notices delivered: **{result["sent"]}**; failed: **{result["failed"]}**.\n\n'
+                '**To stop the process, use PebbleHost’s Stop button.** '
+                'Use `/status` to resume manually after checking pending roles.', accent='warning')
+        except ValueError as exc:
+            e = brand_embed('Cannot enter maintenance', str(exc), accent='warning')
+        except Exception:
+            log.exception('Unexpected maintenance activation failure')
+            e = brand_embed('Maintenance error',
+                            'Check the PebbleHost console. Maintenance may already be enabled; '
+                            'verify with `/status` before taking further action.', accent='warning')
+        await interaction.edit_original_response(embed=e, view=None)
+
+    @discord.ui.button(label='Cancel', style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.edit_message(
+            embed=brand_embed('Cancelled', 'Umask remains unchanged.'), view=None)
+
+
+class MaintenanceMessageModal(discord.ui.Modal, title='Prepare Umask for maintenance'):
+    note = discord.ui.TextInput(label='Optional message to all configured servers',
+                                placeholder='Short operator notice (optional)',
+                                style=discord.TextStyle.paragraph,
+                                required=False, max_length=500)
+
+    def __init__(self, requester_id: int):
+        super().__init__(timeout=180)
+        self.requester_id = requester_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.user.id != self.requester_id or not await bot.is_owner(interaction.user):
+            return await reply(interaction, 'This maintenance action is restricted to the application owner.')
+        if bot.maintenance_mode:
+            return await reply(interaction, 'Umask is already in maintenance mode.')
+        note = str(self.note.value or '').strip()
+        view = MaintenanceConfirmation(interaction.user.id, note)
+        preview = discord.utils.escape_mentions(discord.utils.escape_markdown(note))[:550] if note else 'No custom message.'
+        e = brand_embed('Confirm service-wide maintenance',
+            'This will persistently **block new elevated sessions**, attempt to revoke '
+            '**all tracked roles**, and post a notice to **every configured alert channel**.\n\n'
+            'This does **not** shut down the PebbleHost process. Any unresolved roles '
+            'must be removed manually; the bot will keep retrying.\n\n'
+            f'**Your additional operator message:**\n{preview}', accent='warning')
+        await interaction.response.send_message(embed=e, view=view, ephemeral=True)
+
+
+class ResumeConfirmation(discord.ui.View):
+    def __init__(self, requester_id: int):
+        super().__init__(timeout=45)
+        self.requester_id = requester_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester_id or not await bot.is_owner(interaction.user):
+            await interaction.response.send_message('Only the application owner may resume service.', ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label='Resume Umask', style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        try:
+            await bot.resume_from_maintenance()
+            e = brand_embed('Umask resumed', 'New staff authentication sessions are available again.')
+        except ValueError as exc:
+            e = brand_embed('Cannot resume', str(exc), accent='warning')
+        await interaction.response.edit_message(embed=e, view=None)
+
+    @discord.ui.button(label='Cancel', style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.edit_message(embed=brand_embed('Unchanged', 'Umask remains in maintenance.'), view=None)
+
+
+class OperatorStatusView(discord.ui.View):
+    def __init__(self, guild: discord.Guild, requester_id: int):
+        super().__init__(timeout=300)
+        self.guild = guild
+        self.requester_id = requester_id
+        self.section = 'overview'
+        self.message: discord.InteractionMessage | None = None
+        self._sync_buttons()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester_id or not await bot.is_owner(interaction.user):
+            await interaction.response.send_message('This dashboard is private to the Discord application owner.', ephemeral=True)
+            return False
+        return True
+
+    def _sync_buttons(self):
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                if item.custom_id in {'umask:operator:overview', 'umask:operator:maintenance'}:
+                    selected = item.custom_id.rsplit(':', 1)[-1] == self.section
+                    item.style = discord.ButtonStyle.primary if selected else discord.ButtonStyle.secondary
+                if item.custom_id == 'umask:operator:prepare':
+                    item.disabled = bot.maintenance_mode
+                elif item.custom_id == 'umask:operator:resume':
+                    item.disabled = not bot.maintenance_mode
+                elif item.custom_id == 'umask:operator:server':
+                    item.disabled = self.guild.owner_id != self.requester_id
+
+    async def render(self) -> discord.Embed:
+        self._sync_buttons()
+        if self.section == 'maintenance':
+            state = '**Enabled**' if bot.maintenance_mode else '**Normal operation**'
+            e = brand_embed('Service maintenance',
+                f'Status: {state}\n'
+                'Preparation blocks new sign-ins, attempts to revoke all tracked roles, '
+                'and announces maintenance to configured channels.\n\n'
+                'Stopping the process is done in **PebbleHost → Stop**; '
+                'restarting the process does not turn maintenance off.\n\n'
+                '**Resume** must be explicitly confirmed after any pending roles are cleared.', accent='warning')
+            if bot.maintenance_state.activated_at:
+                e.add_field(name='Enabled at', value=f'<t:{bot.maintenance_state.activated_at}:f>')
+            try:
+                e.add_field(name='Tracked roles still pending', value=str(len(bot.store.all_sessions())))
+            except Exception:
+                e.add_field(name='Tracked roles still pending', value='Storage unavailable')
+            return e
+        e = brand_embed('Application overview', 'Private operational status across Umask servers.')
+        e.add_field(name='Connected servers', value=str(len(bot.guilds)), inline=True)
+        e.add_field(name='Process uptime', value=human_uptime(time.monotonic()-bot.process_started), inline=True)
+        e.add_field(name='Gateway latency',
+                    value=f'{bot.latency * 1000:.0f} ms' if bot.latency >= 0 and bot.is_ready() else 'Not connected',
+                    inline=True)
+        try:
+            configs = len(set(bot.store.configured_guild_ids()) & {guild.id for guild in bot.guilds})
+            tracked = bot.store.all_sessions()
+            e.add_field(name='Configured servers', value=str(configs), inline=True)
+            e.add_field(name='Tracked active / pending', value=str(len(tracked)), inline=True)
+        except Exception:
+            e.add_field(name='Database', value='Unavailable — check logs', inline=False)
+        e.add_field(name='Database backend', value=('MySQL' if isinstance(bot.store, MySQLStore) else 'SQLite'), inline=True)
+        e.add_field(name='Maintenance', value='ON — sign-ins disabled' if bot.maintenance_mode else 'Off', inline=True)
+        e.add_field(name='Session reconciliation',
+                    value=f'<t:{bot.last_reconciliation_at}:R>' if bot.last_reconciliation_at else 'Not completed yet', inline=True)
+        e.add_field(name='Daily housekeeping',
+                    value=f'<t:{bot.last_maintenance_at}:R>' if bot.last_maintenance_at else 'Not completed yet', inline=True)
+        if isinstance(bot.store, Store):
+            snapshots = sorted(Path(os.getenv('LOCAL_BACKUP_DIR', './backups')).glob('umask-????-??-??.sqlite3'))
+            e.add_field(name='Latest local SQLite snapshot',
+                        value=(snapshots[-1].stem.removeprefix('umask-') if snapshots else 'None found yet'), inline=True)
+        e.set_footer(text='Application owner only · Data available from this running process')
+        return e
+
+    async def switch(self, interaction: discord.Interaction, section: str):
+        self.section = section
+        await interaction.response.defer()
+        await interaction.edit_original_response(embed=await self.render(), view=self)
+
+    @discord.ui.button(label='Overview', style=discord.ButtonStyle.primary,
+                       row=0, custom_id='umask:operator:overview')
+    async def overview(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.switch(interaction, 'overview')
+
+    @discord.ui.button(label='Maintenance / shutdown', style=discord.ButtonStyle.secondary,
+                       row=0, custom_id='umask:operator:maintenance')
+    async def maintenance(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.switch(interaction, 'maintenance')
+
+    @discord.ui.button(label='Check guild owner', style=discord.ButtonStyle.secondary,
+                       row=0, custom_id='umask:operator:check-owner')
+    async def check_owner(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(GuildOwnershipModal(interaction.user.id))
+
+    @discord.ui.button(label='This server', style=discord.ButtonStyle.secondary,
+                       row=0, custom_id='umask:operator:server')
+    async def server_dashboard(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not require_owner(interaction):
+            return await reply(interaction, 'You do not own this Discord server.')
+        view = OwnerStatusView(interaction.guild, interaction.user.id)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await interaction.followup.send(embed=await view.render(), view=view, ephemeral=True)
+
+    @discord.ui.button(label='Prepare shutdown', style=discord.ButtonStyle.danger,
+                       row=1, custom_id='umask:operator:prepare')
+    async def prepare(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if bot.maintenance_mode:
+            return await reply(interaction, 'Umask is already in maintenance mode.')
+        await interaction.response.send_modal(MaintenanceMessageModal(interaction.user.id))
+
+    @discord.ui.button(label='Resume service', style=discord.ButtonStyle.secondary,
+                       row=1, custom_id='umask:operator:resume')
+    async def resume(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            embed=brand_embed('Confirm resume', 'Resume issuing and granting elevated sessions? '
+                             'Make sure all previously tracked roles have been cleared.', accent='warning'),
+            view=ResumeConfirmation(interaction.user.id), ephemeral=True)
+
+    @discord.ui.button(label='Refresh', style=discord.ButtonStyle.secondary,
+                       row=1, custom_id='umask:operator:refresh')
+    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.switch(interaction, self.section)
+
+    @discord.ui.button(label='Close', style=discord.ButtonStyle.secondary,
+                       row=1, custom_id='umask:operator:close')
+    async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.edit_message(embed=brand_embed('Dashboard closed',
+                                                 'Run `/status` to open it again.'), view=None)
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+
 @bot.tree.command(name="status", description="Your access, or the owner's private server dashboard")
 @app_commands.guild_only()
 async def status(interaction: discord.Interaction):
+    if await bot.is_owner(interaction.user):
+        view = OperatorStatusView(interaction.guild, interaction.user.id)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        attachment = logo_attachment()
+        await interaction.edit_original_response(
+            embed=await view.render(), view=view,
+            attachments=[attachment] if attachment else [])
+        try:
+            view.message = await interaction.original_response()
+        except discord.HTTPException:
+            pass
+        return
     cfg = bot.store.config(interaction.guild_id)
     if require_owner(interaction):
         view = OwnerStatusView(interaction.guild, interaction.user.id)
