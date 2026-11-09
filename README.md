@@ -1,4 +1,3 @@
-[README.md](https://github.com/user-attachments/files/34600847/README.md)
 # umask
 
 **Elevated permissions for Discord staff. Only when needed.**
