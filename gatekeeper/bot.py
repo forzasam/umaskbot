@@ -909,6 +909,145 @@ async def setup(interaction: discord.Interaction):
         pass
 
 
+async def _issue_credential(interaction: discord.Interaction, member_id: int, *,
+                            replacing: tuple[int, str] | None = None) -> None:
+    """Issue under the per-member lock, or require confirmation for replacement.
+
+    `replacing` identifies the exact credential displayed in the confirmation.
+    A concurrent reissue/revoke invalidates that confirmation instead of allowing
+    its button to overwrite a more recent credential.
+    """
+    try:
+        if not require_owner(interaction):
+            raise ValueError("Only the server owner can issue credentials.")
+        async with bot.lock(interaction.guild_id, member_id):
+            if bot.maintenance_mode or bot._closing_gatekeeper or bot._shutdown_requested:
+                raise ValueError("Umask is in maintenance or shutting down. No credential was issued.")
+            cfg = bot.store.config(interaction.guild_id)
+            if not cfg:
+                raise ValueError("Run `/setup` first.")
+            if bot.privacy_ledger.guild_pending_erasure(interaction.guild_id, cfg['updated_at']):
+                raise ValueError("This server's previous Umask setup is being removed under a verified privacy request. Reconfigure only after pending roles are cleared.")
+            member = await bot.get_member(interaction.guild, member_id)
+            role = interaction.guild.get_role(cfg['elevated_role_id'])
+            if not member or not role:
+                raise ValueError("Staff member or configured active role is missing.")
+            if member.bot or member.id == interaction.guild.owner_id:
+                raise ValueError("Choose a human staff member who is not the server owner.")
+            await bot.verify_bot_role(interaction.guild, role)
+            problem = permissions_issue(member, cfg['staff_role_id'], role)
+            if problem:
+                raise ValueError(problem)
+            if bot.store.session(interaction.guild_id, member_id):
+                raise ValueError("This member still has a tracked active session. Use `/revoke` first to end it and replace the key.")
+            if role.id in {r.id for r in member.roles}:
+                raise ValueError("The member already has the active role outside a tracked session. Remove it manually first.")
+
+            existing = bot.store.credential(interaction.guild_id, member_id)
+            if replacing is None and existing is not None:
+                # No write occurs until the owner explicitly confirms.
+                view = ConfirmCredentialReplacement(
+                    interaction, member_id,
+                    (int(existing['issued_at']), existing['phrase_hash']))
+                embed = brand_embed(
+                    "Replace existing credential?",
+                    f"{member.mention} already has an issued code.\n\n"
+                    "Issuing another will **immediately invalidate the old phrase**. "
+                    "They'll need to run `/receive` again within 15 minutes "
+                    "to collect the new one.\n\n"
+                    "Issue a replacement?",
+                    accent="warning")
+                await interaction.edit_original_response(content=None, embed=embed, view=view)
+                return
+            if replacing is not None and (
+                    existing is None or
+                    (int(existing['issued_at']), existing['phrase_hash']) != replacing):
+                raise ValueError("That credential has changed or been revoked since you opened the confirmation. Run `/issue` again to review the current state.")
+
+            phrase = generate_phrase()
+            digest = await asyncio.to_thread(hash_phrase, phrase)
+            cipher = bot.fernet.encrypt(phrase.encode('utf-8'))
+            async with bot.shutdown_lock:
+                if bot.maintenance_mode or bot._closing_gatekeeper or bot._shutdown_requested:
+                    raise ValueError('Umask entered maintenance while issuing this credential. No credential was issued.')
+                bot.store.issue(interaction.guild_id, member_id, digest, cipher, int(time.time()) + 900)
+    except (ValueError, discord.HTTPException) as error:
+        await interaction.edit_original_response(
+            content=None, embed=brand_embed("Credential not issued", f"{error}", accent="warning"),
+            view=None)
+        return
+
+    await interaction.edit_original_response(
+        content=None,
+        embed=brand_embed(
+            "Credential issued",
+            f"**Credential issued for {member.display_name}** (`{member.id}`) in this server.\n"
+            f"`{phrase}`\n\n"
+            "**Shown once to you.** The staff member must use the **new** phrase. "
+            "They can run `/receive` within 15 minutes to collect it privately once. "
+            "Their previous phrase no longer works. "
+            "Only deliver a replacement if you've verified the real person controls the account. "
+            "If that account is compromised, an attacker may collect the new phrase. "
+            "This message will be deleted after approximately 60 seconds while the bot is online."),
+        view=None)
+    bot.schedule_secret_deletion(interaction)
+
+
+class ConfirmCredentialReplacement(discord.ui.View):
+    """Ephemeral owner-only confirmation; no persistent credential changes until clicked."""
+
+    def __init__(self, source_interaction: discord.Interaction, member_id: int,
+                 expected_credential: tuple[int, str]):
+        super().__init__(timeout=120)
+        self.source_interaction = source_interaction
+        self.guild_id = source_interaction.guild_id
+        self.owner_id = source_interaction.user.id
+        self.member_id = member_id
+        self.expected_credential = expected_credential
+        self.used = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if (interaction.guild_id != self.guild_id or interaction.user.id != self.owner_id or
+                not require_owner(interaction)):
+            await interaction.response.send_message(
+                "Only the server owner who requested this replacement can confirm it.", ephemeral=True)
+            return False
+        if self.used:
+            await interaction.response.send_message(
+                "This confirmation has already been handled. Run `/issue` to try again.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Issue replacement", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.used = True
+        self.stop()
+        await interaction.response.defer()
+        # Edit the original ephemeral /issue response. This also lets the normal
+        # one-time secret-deletion task remove the phrase from that response.
+        await _issue_credential(self.source_interaction, self.member_id,
+                                replacing=self.expected_credential)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.used = True
+        self.stop()
+        await interaction.response.edit_message(
+            embed=brand_embed("Replacement cancelled",
+                              "The existing authentication code has not been changed."),
+            view=None)
+
+    async def on_timeout(self):
+        self.used = True
+        try:
+            await self.source_interaction.edit_original_response(
+                embed=brand_embed("Confirmation expired",
+                                  "No credential was changed. Run `/issue` to try again."),
+                view=None)
+        except (discord.HTTPException, discord.NotFound):
+            pass
+
+
 @bot.tree.command(name="issue", description="Issue a staff authentication code.")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
@@ -918,44 +1057,7 @@ async def issue(interaction: discord.Interaction, member: discord.Member):
     if not require_owner(interaction):
         return await reply(interaction, "Only the server owner can issue credentials.")
     await interaction.response.defer(ephemeral=True, thinking=True)
-    cfg = bot.store.config(interaction.guild_id)
-    if not cfg:
-        return await reply(interaction, "Run `/setup` first.")
-    if bot.privacy_ledger.guild_pending_erasure(interaction.guild_id, cfg['updated_at']):
-        return await reply(interaction, "This server's previous Umask setup is being removed under a verified privacy request. Reconfigure only after pending roles are cleared.")
-    if member.bot or member.id == interaction.guild.owner_id:
-        return await reply(interaction, "Choose a human staff member who is not the server owner.")
-    async with bot.lock(interaction.guild_id, member.id):
-        try:
-            member = await bot.get_member(interaction.guild, member.id)
-            role = interaction.guild.get_role(cfg['elevated_role_id'])
-            if not member or not role:
-                raise ValueError("Staff member or configured active role is missing.")
-            await bot.verify_bot_role(interaction.guild, role)
-            problem = permissions_issue(member, cfg['staff_role_id'], role)
-            if problem:
-                raise ValueError(problem)
-            if bot.store.session(interaction.guild_id, member.id):
-                raise ValueError("This member still has a tracked active session. Use `/revoke` first to end it and replace the key.")
-            if role.id in {r.id for r in member.roles}:
-                raise ValueError("The member already has the active role outside a tracked session. Remove it manually first.")
-            phrase = generate_phrase()
-            digest = await asyncio.to_thread(hash_phrase, phrase)
-            cipher = bot.fernet.encrypt(phrase.encode('utf-8'))
-            async with bot.shutdown_lock:
-                if bot.maintenance_mode or bot._closing_gatekeeper or bot._shutdown_requested:
-                    raise ValueError('Umask entered maintenance while issuing this credential. No credential was issued.')
-                bot.store.issue(interaction.guild_id, member.id, digest, cipher, int(time.time())+900)
-        except (ValueError, discord.HTTPException) as e:
-            return await reply(interaction, f"Cannot issue credential: {e}")
-    await reply(interaction,
-        f"**Credential issued for {member.display_name}** (`{member.id}`) in this server.\n"
-        f"`{phrase}`\n\n"
-        "**Shown once to you.** The staff member can run `/receive` within 15 minutes to view it privately once. "
-        "Only deliver a replacement if you've verified the real person controls the account. "
-        "If the account is already compromised, an attacker may collect the new key. "
-        "This confirmation will be deleted after approximately 60 seconds while the bot is online.",
-        secret=True, title="Credential issued")
+    await _issue_credential(interaction, member.id)
 
 
 @bot.tree.command(name="receive", description="Collect your authentication code.")
