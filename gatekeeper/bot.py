@@ -1,5 +1,6 @@
 """Discord application commands and durable role/session reconciliation."""
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -7,6 +8,7 @@ import time
 import traceback
 from pathlib import Path
 from collections import defaultdict
+from typing import Literal
 
 import discord
 from discord import app_commands
@@ -56,6 +58,56 @@ def parse_durations(raw: str) -> tuple[int, ...]:
     if not values or len(values) > 8 or any(v < 5 or v > 1440 for v in values):
         raise ValueError("Choose 1–8 durations between 5 and 1,440 minutes.")
     return tuple(values)
+
+
+# Only the optional private-admin /set-status command may update bot presence.
+# The small JSON file persists across PebbleHost restarts and stays out of Git.
+PRESENCE_TYPES = {'playing', 'watching', 'listening', 'competing', 'custom'}
+PRESENCE_AVAILABILITY = {'online', 'idle', 'dnd', 'invisible'}
+
+
+def configured_activity(kind: str, text: str | None):
+    if not text:
+        return None
+    if kind == 'playing':
+        return discord.Game(name=text)
+    if kind == 'custom':
+        return discord.CustomActivity(name=text)
+    return discord.Activity(type=getattr(discord.ActivityType, kind), name=text)
+
+
+def read_presence(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+        if not isinstance(data, dict):
+            raise ValueError('Expected a JSON object')
+        kind, text, availability = (data.get('kind'), data.get('text'),
+                                   data.get('availability'))
+        if (kind not in PRESENCE_TYPES or availability not in PRESENCE_AVAILABILITY or
+                (text is not None and (not isinstance(text, str) or not 1 <= len(text) <= 128))):
+            raise ValueError('Invalid saved activity configuration')
+        return {'kind': kind, 'text': text, 'availability': availability}
+    except (OSError, ValueError, TypeError):
+        log.exception('Saved bot presence is invalid; no custom presence will be applied')
+        return None
+
+
+def write_presence(path: Path, setting: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + '.tmp')
+    try:
+        with temporary.open('w', encoding='utf-8') as stream:
+            json.dump(setting, stream, ensure_ascii=False)
+            stream.write('\n')
+        try:
+            temporary.chmod(0o600)
+        except OSError:
+            pass
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def permissions_issue(member: discord.Member, staff_role_id: int, elevated: discord.Role) -> str | None:
@@ -116,6 +168,20 @@ class Umask(commands.Bot):
             os.getenv('MAINTENANCE_STATE_PATH', './private/maintenance.json'),
             require_existing=os.getenv('MAINTENANCE_REQUIRE_EXISTING', '0') == '1')
         self.maintenance_mode = self.maintenance_state.enabled
+        self.presence_path = Path(os.getenv('BOT_PRESENCE_PATH', './private/presence.json'))
+        self.saved_presence = read_presence(self.presence_path)
+
+    async def is_owner(self, user) -> bool:
+        # Optional strict application-owner ID, useful for team-owned apps:
+        # discord.py's default team check can include additional team members.
+        configured = os.getenv('BOT_OWNER_ID', '').strip()
+        if configured:
+            try:
+                return user.id == int(configured)
+            except ValueError:
+                log.error('BOT_OWNER_ID must be a numeric Discord user ID')
+                return False
+        return await super().is_owner(user)
 
     async def setup_hook(self):
         dev_guild = os.environ.get("DEV_GUILD_ID")
@@ -130,11 +196,10 @@ class Umask(commands.Bot):
         ops_id = os.getenv('PRIVACY_ADMIN_GUILD_ID', '').strip()
         if ops_id:
             register_privacy_ops(self, int(ops_id))
-            # Never expose operator commands globally.
-            if ops_id == dev_guild:
-                await self.tree.sync(guild=discord.Object(id=int(ops_id)))
-            else:
-                await self.tree.sync(guild=discord.Object(id=int(ops_id)))
+            # Register a private /set-status command. The public /status
+            # dashboard remains unchanged in every server.
+            register_private_set_status_command(self, int(ops_id))
+            await self.tree.sync(guild=discord.Object(id=int(ops_id)))
             log.info('Installed private operator commands in guild=%s', ops_id)
         self.reconciler.start()
         self.maintenance_loop.start()
@@ -161,6 +226,16 @@ class Umask(commands.Bot):
 
     async def on_ready(self):
         log.info("Connected as %s (%s)", self.user, self.user.id if self.user else "unknown")
+        # Discord presence isn't durable across gateway reconnects. Restore
+        # the operator's saved choice on each ready event, if one exists.
+        if self.saved_presence is not None:
+            try:
+                setting = self.saved_presence
+                await self.change_presence(
+                    status=getattr(discord.Status, setting['availability']),
+                    activity=configured_activity(setting['kind'], setting['text']))
+            except (discord.DiscordException, TypeError, ValueError):
+                log.exception('Could not restore saved bot presence')
         try:
             await self.reconcile()
         except Exception:
@@ -578,6 +653,22 @@ async def ping(interaction: discord.Interaction):
     latency = bot.latency
     value = f'Pong! Gateway latency: {round(latency * 1000)} ms.' if latency >= 0 else 'Pong! Gateway latency unavailable.'
     await interaction.response.send_message(value, ephemeral=True)
+
+
+@bot.tree.command(name="help", description="Set up and use Umask.")
+async def help_command(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        '**Getting started**\n'
+        '1. Create a **permanent staff role** and a separate **elevated role** for '
+        'temporary permissions. The elevated role cannot include Administrator or Manage Roles.\n'
+        '2. Give Umask **Manage Roles** and place its bot role **directly above** '
+        'the elevated role. It does not need the elevated role’s permissions.\n'
+        '3. The **server owner** runs `/setup`, then `/issue` for each staff member.\n'
+        '4. Staff run `/receive` within 15 minutes to save their private phrase, '
+        'then `/authenticate` when they need access.\n'
+        '5. Access ends on `/signout` or expiry. The owner can use `/revoke` '
+        'to invalidate a phrase.\n\n'
+        'Need help? `/support` or https://umask.app', ephemeral=True)
 
 
 # The setup wizard deliberately uses a standard ephemeral View rather than a
@@ -1772,6 +1863,72 @@ async def status(interaction: discord.Interaction):
     embed.add_field(name="Elevated role", value=role.mention if role else "Missing role", inline=False)
     embed.set_footer(text="/authenticate to sign in · /signout to end a session")
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+def register_private_set_status_command(application: Umask, guild_id: int) -> None:
+    """Register operator-only /set-status in the configured private guild.
+
+    Syncing this guild removes the obsolete private /status override from
+    Discord, exposing the ordinary dashboard-only /status again.
+    """
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.describe(
+        text='Activity text (1–128 characters)',
+        kind='How the activity appears in Discord',
+        availability='Online, idle, busy or invisible',
+        clear='Remove the current activity text')
+    async def private_set_status(
+        interaction: discord.Interaction,
+        text: str | None = None,
+        kind: Literal['playing', 'watching', 'listening', 'competing', 'custom'] = 'playing',
+        availability: Literal['online', 'idle', 'dnd', 'invisible'] = 'online',
+        clear: bool = False,
+    ):
+        # This check is necessary even inside the private guild. Discord's
+        # command visibility is not an authorisation boundary.
+        if interaction.guild_id != guild_id or not await application.is_owner(interaction.user):
+            await interaction.response.send_message('Not authorised.', ephemeral=True)
+            return
+        if clear and text is not None:
+            await interaction.response.send_message('Use either `text` or `clear`, not both.', ephemeral=True)
+            return
+        if text is None and not clear:
+            await interaction.response.send_message(
+                'Enter an activity in `text`, or set `clear` to true.', ephemeral=True)
+            return
+        if text is not None:
+            text = text.strip()
+            if not 1 <= len(text) <= 128:
+                await interaction.response.send_message('Enter 1–128 characters.', ephemeral=True)
+                return
+        setting = {'kind': kind, 'text': None if clear else text,
+                   'availability': availability}
+        try:
+            # Persist first, before telling the operator that it is saved.
+            write_presence(application.presence_path, setting)
+            application.saved_presence = setting
+            await application.change_presence(
+                status=getattr(discord.Status, availability),
+                activity=configured_activity(kind, setting['text']))
+        except OSError:
+            log.exception('Could not persist requested bot presence')
+            await interaction.response.send_message('Could not save presence. Check PebbleHost file access.', ephemeral=True)
+            return
+        except (discord.DiscordException, TypeError, ValueError):
+            log.exception('Could not apply requested bot presence')
+            await interaction.response.send_message('Presence was saved, but Discord did not apply it. It will retry on reconnect.', ephemeral=True)
+            return
+        if setting['text']:
+            result = f"Presence updated: **{kind.title()} {discord.utils.escape_markdown(setting['text'])}** ({availability})."
+        else:
+            result = f'Activity cleared. Availability: **{availability}**.'
+        await interaction.response.send_message(result, ephemeral=True)
+
+    private_command = app_commands.Command(
+        name='set-status', description='Set the bot’s activity and availability.',
+        callback=private_set_status)
+    # /status stays the regular public command, including in the admin server.
+    application.tree.add_command(private_command, guild=discord.Object(id=guild_id))
 
 
 @bot.tree.error
