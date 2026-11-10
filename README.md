@@ -41,4 +41,4 @@ The licence permits noncommercial use and inspection of the software, but does n
 
 Our goal is transparency, not encouraging commercial repackaging of Umask. The official bot's core security functionality will always remain free to use.
 
-See [LICENSE](LICENSE) for the full terms.
+See [LICENSE](LICENSE.txt) for the full terms.
