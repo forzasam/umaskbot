@@ -30,3 +30,15 @@ umask is intended to reduce the risk posed by compromised staff accounts by limi
 Visit **[umask.app](https://umask.app)** to install the bot and find setup information. For help, use `/support` in Discord or email **[support@umask.app](mailto:support@umask.app)**.
 
 [Privacy Policy](https://umask.app/privacy.html) · [Terms of Service](https://umask.app/terms.html) · [Data requests](https://umask.app/data-request.html)
+
+## Source code and licensing
+
+Umask's source code is publicly available because we believe server owners should be able to inspect how a security bot operates before trusting it with their server.
+
+The project is **source-available under the PolyForm Strict License 1.0.0**.
+
+The licence permits noncommercial use and inspection of the software, but does not permit modification, redistribution or commercial exploitation without separate permission.
+
+Our goal is transparency, not encouraging commercial repackaging of Umask. The official bot's core security functionality will always remain free to use.
+
+See [LICENSE](LICENSE) for the full terms.
