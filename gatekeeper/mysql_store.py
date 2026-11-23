@@ -9,6 +9,7 @@ Production requirement: run only ONE Umask bot process against this database.
 from __future__ import annotations
 
 import os
+import json
 import threading
 import time
 from contextlib import contextmanager
@@ -108,8 +109,16 @@ class MySQLStore:
                     cur.execute('ALTER TABLE session_history ADD COLUMN hold_until BIGINT NULL')
                 if 'hold_reference' not in fields:
                     cur.execute('ALTER TABLE session_history ADD COLUMN hold_reference VARCHAR(64) NULL')
+                cur.execute('SHOW COLUMNS FROM guild_config')
+                config_fields = {r['Field'] for r in cur.fetchall()}
+                if 'elevated_roles' not in config_fields:
+                    cur.execute('ALTER TABLE guild_config ADD COLUMN elevated_roles TEXT NULL')
                 cur.execute('SHOW COLUMNS FROM credentials')
                 cred_fields = {r['Field'] for r in cur.fetchall()}
+                if 'role_id' not in cred_fields:
+                    cur.execute('ALTER TABLE credentials ADD COLUMN role_id BIGINT UNSIGNED NULL')
+                cur.execute('''UPDATE credentials c JOIN guild_config g ON c.guild_id=g.guild_id
+                    SET c.role_id=g.elevated_role_id WHERE c.role_id IS NULL''')
                 for col, ddl in (
                     ('staff_missing_since', 'BIGINT NULL'),
                     ('staff_loss_notified_at', 'BIGINT NULL'),
@@ -161,26 +170,44 @@ class MySQLStore:
     def configured_guild_ids(self) -> set[int]:
         return {int(row['guild_id']) for row in self._all('SELECT guild_id FROM guild_config')}
 
-    def set_config(self, guild_id, staff_role_id, elevated_role_id, durations, alert_channel_id):
+    def managed_roles(self, guild_id):
+        cfg = self.config(guild_id)
+        if not cfg:
+            return ()
+        raw = cfg['elevated_roles']
+        return tuple(int(x) for x in json.loads(raw)) if raw else (int(cfg['elevated_role_id']),)
+
+    def set_config(self, guild_id, staff_role_id, elevated_role_ids, durations, alert_channel_id):
+        roles = tuple(sorted(set(int(x) for x in elevated_role_ids)))
+        if not roles or len(roles) > 25:
+            raise ValueError('Select between 1 and 25 elevated roles.')
         with self.tx() as cur:
             cur.execute('SELECT * FROM guild_config WHERE guild_id=%s FOR UPDATE', (guild_id,))
-            existing = cur.fetchone()
-            change = bool(existing and (existing['staff_role_id'] != staff_role_id or
-                                       existing['elevated_role_id'] != elevated_role_id))
-            if change:
+            old = cur.fetchone()
+            old_roles = set(json.loads(old['elevated_roles'])) if old and old['elevated_roles'] else ({int(old['elevated_role_id'])} if old else set())
+            removed = old_roles - set(roles)
+            staff_changed = bool(old and int(old['staff_role_id']) != staff_role_id)
+            changed = bool(old and (staff_changed or removed))
+            if changed:
                 cur.execute('SELECT COUNT(*) AS n FROM sessions WHERE guild_id=%s', (guild_id,))
                 if cur.fetchone()['n']:
-                    raise ValueError('Sign out or revoke all active sessions before changing protected roles.')
+                    raise ValueError('Sign out or revoke all active sessions before removing protected roles or changing the staff role.')
+            if staff_changed:
                 cur.execute('DELETE FROM credentials WHERE guild_id=%s', (guild_id,))
+            elif removed:
+                for r in removed:
+                    cur.execute('DELETE FROM credentials WHERE guild_id=%s AND role_id=%s', (guild_id,r))
+            primary = int(old['elevated_role_id']) if old and int(old['elevated_role_id']) in roles else roles[0]
             cur.execute('''INSERT INTO guild_config
-                  (guild_id,staff_role_id,elevated_role_id,durations,alert_channel_id,updated_at)
-                  VALUES (%s,%s,%s,%s,%s,%s)
-                  ON DUPLICATE KEY UPDATE staff_role_id=VALUES(staff_role_id),
-                    elevated_role_id=VALUES(elevated_role_id), durations=VALUES(durations),
-                    alert_channel_id=VALUES(alert_channel_id), updated_at=VALUES(updated_at)''',
-                        (guild_id,staff_role_id,elevated_role_id,','.join(map(str,durations)),
-                         alert_channel_id,int(time.time())))
-        return change
+                (guild_id,staff_role_id,elevated_role_id,durations,alert_channel_id,updated_at,elevated_roles)
+                VALUES (%s,%s,%s,%s,%s,%s,%s)
+                ON DUPLICATE KEY UPDATE staff_role_id=VALUES(staff_role_id),
+                elevated_role_id=VALUES(elevated_role_id),durations=VALUES(durations),
+                alert_channel_id=VALUES(alert_channel_id),updated_at=VALUES(updated_at),
+                elevated_roles=VALUES(elevated_roles)''',
+                (guild_id,staff_role_id,primary,','.join(map(str,durations)),
+                 alert_channel_id,int(time.time()),json.dumps(roles)))
+        return changed
 
     def count_sessions(self, guild_id):
         return self._one('SELECT COUNT(*) AS n FROM sessions WHERE guild_id=%s', (guild_id,))['n']
@@ -207,22 +234,22 @@ class MySQLStore:
 
     def credentials_for_guild(self, guild_id, limit=10, offset=0):
         # Do not expose either verifier hashes or escrow ciphertext in dashboard queries.
-        return self._all('''SELECT user_id, issued_at, pending_until,
+        return self._all('''SELECT user_id, role_id, issued_at, pending_until,
                  CASE WHEN pending_secret IS NOT NULL THEN 1 ELSE 0 END AS has_pending_copy,
                  collected_at, staff_missing_since, staff_loss_notified_at, permission_warning_key FROM credentials WHERE guild_id=%s
                  ORDER BY issued_at DESC, user_id ASC LIMIT %s OFFSET %s''',
                          (guild_id,int(limit),int(offset)))
 
-    def issue(self, guild_id, user_id, hash_value, encrypted, valid_until):
+    def issue(self, guild_id, user_id, hash_value, encrypted, valid_until, role_id):
         with self.tx() as cur:
             cur.execute('''INSERT INTO credentials
-              (guild_id,user_id,phrase_hash,pending_secret,pending_until,issued_at,attempts,locked_until,collected_at)
-              VALUES (%s,%s,%s,%s,%s,%s,0,0,0)
+              (guild_id,user_id,phrase_hash,pending_secret,pending_until,issued_at,attempts,locked_until,collected_at,role_id)
+              VALUES (%s,%s,%s,%s,%s,%s,0,0,0,%s)
               ON DUPLICATE KEY UPDATE phrase_hash=VALUES(phrase_hash),
               pending_secret=VALUES(pending_secret),pending_until=VALUES(pending_until),
-              issued_at=VALUES(issued_at),attempts=0,locked_until=0,collected_at=0,
+              issued_at=VALUES(issued_at),role_id=VALUES(role_id),attempts=0,locked_until=0,collected_at=0,
               staff_missing_since=NULL,staff_loss_notified_at=NULL,permission_warning_key=NULL''',
-                        (guild_id,user_id,hash_value,encrypted,valid_until,int(time.time())))
+                        (guild_id,user_id,hash_value,encrypted,valid_until,int(time.time()),role_id))
 
     def monitor_credential_batch(self, limit: int = 40, offset: int = 0):
         return self._all('''SELECT guild_id,user_id,staff_missing_since,

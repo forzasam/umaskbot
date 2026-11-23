@@ -6,6 +6,7 @@ import os
 import signal
 import time
 import traceback
+from datetime import time as clock_time, timezone
 from pathlib import Path
 from collections import defaultdict
 from typing import Literal
@@ -34,6 +35,18 @@ SLATE = 0x56566B
 SOFT_WARNING = 0xC88FA8
 
 
+def backup_schedule_utc() -> clock_time:
+    """Parse the fixed daily backup time in UTC (HH:MM)."""
+    raw = os.getenv('BACKUP_TIME_UTC', '04:00').strip()
+    match = __import__('re').fullmatch(r'([01]\d|2[0-3]):([0-5]\d)', raw)
+    if not match:
+        raise ValueError('BACKUP_TIME_UTC must be HH:MM in 24-hour UTC time, e.g. 04:00')
+    return clock_time(int(match.group(1)), int(match.group(2)), tzinfo=timezone.utc)
+
+
+BACKUP_SCHEDULE_UTC = backup_schedule_utc()
+
+
 def brand_embed(title: str, description: str = "", *, accent: str = "primary") -> discord.Embed:
     colours = {"primary": LAVENDER, "muted": SLATE, "warning": SOFT_WARNING}
     embed = discord.Embed(title=title, description=description,
@@ -51,13 +64,22 @@ SENSITIVE = discord.Permissions(
 
 
 def parse_durations(raw: str) -> tuple[int, ...]:
+    """Read old comma-separated choices and new single maximum (minutes).
+
+    Existing servers automatically inherit their former longest permitted session
+    as their maximum; no destructive database migration is required.
+    """
     try:
-        values = sorted({int(s.strip()) for s in raw.split(",")})
-    except ValueError as e:
-        raise ValueError("Enter comma-separated minutes, e.g. `15,60,240`.") from e
-    if not values or len(values) > 8 or any(v < 5 or v > 1440 for v in values):
-        raise ValueError("Choose 1–8 durations between 5 and 1,440 minutes.")
-    return tuple(values)
+        values = [int(part.strip()) for part in str(raw).split(",")]
+    except (ValueError, TypeError) as exc:
+        raise ValueError("Set a maximum session duration in minutes.") from exc
+    if not values or any(value < 5 or value > 1440 for value in values):
+        raise ValueError("Maximum session duration must be between 5 and 1,440 minutes.")
+    return (max(values),)
+
+
+def maximum_duration(raw: str) -> int:
+    return parse_durations(raw)[0]
 
 
 # Only the optional private-admin /set-status command may update bot presence.
@@ -110,7 +132,8 @@ def write_presence(path: Path, setting: dict) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def permissions_issue(member: discord.Member, staff_role_id: int, elevated: discord.Role) -> str | None:
+def permissions_issue(member: discord.Member, staff_role_id: int, elevated: discord.Role, *,
+                      tracked_role_id: int | None = None) -> str | None:
     """Check obvious permanent role bypasses before allowing elevation.
 
     Guild-level role checks intentionally do not model all channel overwrites or
@@ -120,11 +143,9 @@ def permissions_issue(member: discord.Member, staff_role_id: int, elevated: disc
     if staff_role_id not in ids:
         return "You no longer have the permanent staff role."
     elevated_sensitive = elevated.permissions.value & SENSITIVE
-    if not elevated_sensitive:
-        return "The active role no longer has protected moderation powers. Ask the owner to review setup."
     others = 0
     for role in member.roles:
-        if role.id != elevated.id:
+        if role.id != elevated.id and role.id != tracked_role_id:
             others |= role.permissions.value
     if others & discord.Permissions(administrator=True, manage_roles=True).value:
         return "A permanent role grants Administrator or Manage Roles, bypassing protected access."
@@ -203,6 +224,8 @@ class Umask(commands.Bot):
             log.info('Installed private operator commands in guild=%s', ops_id)
         self.reconciler.start()
         self.maintenance_loop.start()
+        log.info('Scheduled daily SQLite backup and maintenance for %s UTC',
+                 BACKUP_SCHEDULE_UTC.strftime('%H:%M'))
         self.credential_monitor.start()
         # Reattach buttons sent by the monitor in earlier process lifetimes.
         # View custom IDs are scoped to the stored guild/user and recheck owner
@@ -309,8 +332,6 @@ class Umask(commands.Bot):
             raise ValueError("Move the bot's role **above** the active role, and use a normal assignable role.")
         if elevated.permissions.administrator or elevated.permissions.manage_roles:
             raise ValueError("For safety, active roles may not contain **Administrator** or **Manage Roles** in this version.")
-        if not elevated.permissions.value & SENSITIVE:
-            raise ValueError("The active role needs a moderation permission (e.g. Ban Members).")
         # Discord allows assigning an existing role below the bot's top role
         # with MANAGE_ROLES, even when the bot lacks the role's permissions.
         # The permission-subset restriction applies to *editing* role permissions.
@@ -380,7 +401,9 @@ class Umask(commands.Bot):
                 # lost. This is an existing security boundary and must not be
                 # delayed by the optional five-minute owner DM grace period.
                 staff_still_authorised = bool(cfg and cfg['staff_role_id'] in {r.id for r in member.roles}
-                                               and cfg['elevated_role_id'] == role.id)
+                                               and role.id in configured_role_ids(cfg)
+                                               and (credential := self.store.credential(guild_id, user_id)) is not None
+                                               and credential_role_id(credential, cfg) == role.id)
                 unsafe_role = role.permissions.administrator or role.permissions.manage_roles
                 if row['termination_reason'] or row['expires_at'] <= now or not staff_still_authorised or unsafe_role:
                     reason = (row['termination_reason'] or
@@ -436,7 +459,7 @@ class Umask(commands.Bot):
             return
         # Report existing Administrator/Manage Roles bypasses only for staff
         # already protected by Umask. Deduplicate on offending role IDs.
-        dangerous = sorted(r.id for r in member.roles if r.id != cfg['elevated_role_id']
+        dangerous = sorted(r.id for r in member.roles if r.id not in configured_role_ids(cfg)
                            and (r.permissions.administrator or r.permissions.manage_roles))
         fingerprint = ','.join(map(str, dangerous)) if dangerous else None
         if fingerprint == row['permission_warning_key']:
@@ -494,9 +517,9 @@ class Umask(commands.Bot):
     async def before_reconcile(self):
         await self.wait_until_ready()
 
-    @tasks.loop(hours=24)
+    @tasks.loop(time=BACKUP_SCHEDULE_UTC)
     async def maintenance_loop(self):
-        # Daily housekeeping runs in the bot process (PebbleHost has no shell).
+        # Daily housekeeping and backup run at the configured UTC clock time.
         # This does NOT approve or process incoming privacy requests.
         try:
             await self.reconcile()
@@ -517,7 +540,7 @@ class Umask(commands.Bot):
             log.info('Maintenance completed; expired history=%s cleared departed servers=%s',
                      removed, departed_removed)
         except Exception:
-            log.exception('Daily maintenance failed; will retry next cycle')
+            log.exception('Daily maintenance failed; will retry at next scheduled UTC time')
 
     @maintenance_loop.before_loop
     async def before_maintenance(self):
@@ -677,6 +700,26 @@ async def help_command(interaction: discord.Interaction):
 SETUP_DURATION_CHOICES = (5, 15, 30, 60, 120, 240, 480, 1440)
 
 
+def configured_role_ids(cfg) -> tuple[int, ...]:
+    """Config row compatible with pre-upgrade single-role databases."""
+    if not cfg:
+        return ()
+    raw = cfg['elevated_roles']
+    return tuple(int(r) for r in json.loads(raw)) if raw else (int(cfg['elevated_role_id']),)
+
+
+def credential_role_id(credential, cfg) -> int:
+    """Legacy credentials are migrated; fallback protects old records."""
+    return int(credential['role_id'] or cfg['elevated_role_id'])
+
+
+def setup_snapshot(cfg):
+    if not cfg:
+        return None
+    return (int(cfg['staff_role_id']), tuple(sorted(configured_role_ids(cfg))),
+            cfg['durations'], cfg['alert_channel_id'], cfg['updated_at'])
+
+
 def pretty_duration(minutes: int) -> str:
     if minutes == 1440:
         return "24 hours"
@@ -697,41 +740,38 @@ def validate_setup_roles(staff_role: discord.Role, active_role: discord.Role) ->
 
 
 class SetupRoleSelect(discord.ui.RoleSelect):
-    def __init__(self, field: str, current: discord.Role | None, row: int):
+    def __init__(self, field: str, current, row: int):
         label = ("1 · Permanent staff role" if field == "staff_role_id" else
-                 "2 · Temporary elevated role")
-        kwargs = {"placeholder": label, "min_values": 1, "max_values": 1, "row": row}
+                 "2 · Temporary elevated roles (select 1–25)")
+        kwargs = {"placeholder": label, "min_values": 1, "max_values": 1 if field == "staff_role_id" else 25, "row": row}
         if current is not None:
-            kwargs["default_values"] = [current]
+            kwargs["default_values"] = current if isinstance(current, list) else [current]
         super().__init__(**kwargs)
         self.field = field
 
     async def callback(self, interaction: discord.Interaction):
-        selected = self.values[0]
-        setattr(self.view, self.field, selected.id)
-        self.default_values = [selected]
+        selected = list(self.values)
+        if self.field == "staff_role_id":
+            self.view.staff_role_id = selected[0].id
+        else:
+            self.view.elevated_role_ids = tuple(role.id for role in selected)
+        self.default_values = selected
         await self.view.refresh(interaction)
 
 
 class SetupDurationSelect(discord.ui.Select):
-    def __init__(self, selected: tuple[int, ...]):
-        available = sorted(set(SETUP_DURATION_CHOICES) | set(selected))
+    def __init__(self, maximum: int):
         options = [discord.SelectOption(
             label=pretty_duration(minutes), value=str(minutes),
-            description=f"{minutes} minutes", default=minutes in selected,
-        ) for minutes in available]
-        super().__init__(placeholder="3 · Allowed session lengths (choose one or more)",
-                         options=options, min_values=1, max_values=min(8, len(options)), row=2)
+            description=f"Up to {minutes} minutes", default=minutes == maximum,
+        ) for minutes in sorted(set(SETUP_DURATION_CHOICES) | {maximum})]
+        super().__init__(placeholder="3 · Maximum session duration",
+                         options=options, min_values=1, max_values=1, row=2)
 
     async def callback(self, interaction: discord.Interaction):
-        selected = tuple(sorted(int(value) for value in self.values))
-        # Existing duration validator caps the number of allowed choices at 8.
-        if len(selected) > 8:
-            return await interaction.response.send_message(
-                "Choose at most eight session lengths.", ephemeral=True)
-        self.view.durations = selected
+        self.view.max_duration = int(self.values[0])
         for option in self.options:
-            option.default = int(option.value) in selected
+            option.default = int(option.value) == self.view.max_duration
         await self.view.refresh(interaction)
 
 
@@ -741,7 +781,7 @@ class SetupChannelSelect(discord.ui.ChannelSelect):
                   "channel_types": [discord.ChannelType.text],
                   "min_values": 0, "max_values": 1, "row": 3}
         if current is not None:
-            kwargs["default_values"] = [current]
+            kwargs["default_values"] = current if isinstance(current, list) else [current]
         super().__init__(**kwargs)
 
     async def callback(self, interaction: discord.Interaction):
@@ -760,15 +800,15 @@ class SetupWizard(discord.ui.View):
         self.guild_id = guild.id
         self.requester_id = requester_id
         self.staff_role_id = cfg['staff_role_id'] if cfg else None
-        self.elevated_role_id = cfg['elevated_role_id'] if cfg else None
-        self.durations = parse_durations(cfg['durations']) if cfg else (15, 60, 240)
+        self.elevated_role_ids = configured_role_ids(cfg)
+        self.max_duration = maximum_duration(cfg['durations']) if cfg else 60
         self.alert_channel_id = cfg['alert_channel_id'] if cfg else None
-        self.config_snapshot = (tuple(cfg[k] for k in ('staff_role_id', 'elevated_role_id', 'durations', 'alert_channel_id', 'updated_at')) if cfg else None)
+        self.config_snapshot = setup_snapshot(cfg)
         self.message: discord.InteractionMessage | None = None
 
         self.add_item(SetupRoleSelect("staff_role_id", guild.get_role(self.staff_role_id), 0))
-        self.add_item(SetupRoleSelect("elevated_role_id", guild.get_role(self.elevated_role_id), 1))
-        self.add_item(SetupDurationSelect(self.durations))
+        self.add_item(SetupRoleSelect("elevated_role_ids", [r for rid in self.elevated_role_ids if (r := guild.get_role(rid))], 1))
+        self.add_item(SetupDurationSelect(self.max_duration))
         channel = guild.get_channel(self.alert_channel_id) if self.alert_channel_id else None
         self.add_item(SetupChannelSelect(channel if isinstance(channel, discord.TextChannel) else None))
 
@@ -796,10 +836,10 @@ class SetupWizard(discord.ui.View):
                               f"Selected: {role_name(self.staff_role_id)}", inline=False)
         embed.add_field(name="2 · Elevated permissions role",
                         value="Contains the permissions staff get **only while signed in**. Create it in Server Settings → Roles, and put Umask's role above it.\n"
-                              f"Selected: {role_name(self.elevated_role_id)}", inline=False)
-        embed.add_field(name="3 · Allowed session lengths",
-                        value="Staff choose one of these when using `/authenticate`. Their role is removed on sign-out or expiry.\n"
-                              "Selected: **" + ", ".join(map(pretty_duration, self.durations)) + "**", inline=False)
+                              "Selected: " + (", ".join(role_name(rid) for rid in self.elevated_role_ids) or "**Not selected**"), inline=False)
+        embed.add_field(name="3 · Maximum session duration",
+                        value="Staff may choose any duration from 5 minutes up to this maximum. If omitted, `/authenticate` uses the maximum.\n"
+                              "Selected: **" + pretty_duration(self.max_duration) + "**", inline=False)
         ch = f"<#{self.alert_channel_id}>" if self.alert_channel_id else "None"
         embed.add_field(name="4 · Shutdown notifications (optional)",
                         value="Where Umask can announce a planned shutdown. The bot needs View Channel and Send Messages there.\n"
@@ -823,14 +863,15 @@ class SetupWizard(discord.ui.View):
             if guild is None:
                 raise ValueError("This setup form is available only inside a server.")
             staff = guild.get_role(self.staff_role_id) if self.staff_role_id else None
-            elevated = guild.get_role(self.elevated_role_id) if self.elevated_role_id else None
-            if not staff or not elevated:
-                raise ValueError("Select both a permanent staff role and a temporary elevated role.")
-            validate_setup_roles(staff, elevated)
-            if staff.guild.id != guild.id or elevated.guild.id != guild.id:
-                raise ValueError("Both roles must belong to this server.")
-            allowed = parse_durations(",".join(map(str, self.durations)))
-            await bot.verify_bot_role(guild, elevated)
+            elevated_roles = [guild.get_role(rid) for rid in self.elevated_role_ids]
+            if not staff or not elevated_roles or any(role is None for role in elevated_roles):
+                raise ValueError("Select a permanent staff role and at least one existing elevated role.")
+            if staff.guild.id != guild.id or any(role.guild.id != guild.id for role in elevated_roles):
+                raise ValueError("All selected roles must belong to this server.")
+            for elevated in elevated_roles:
+                validate_setup_roles(staff, elevated)
+                await bot.verify_bot_role(guild, elevated)
+            allowed = (self.max_duration,)
             channel = guild.get_channel(self.alert_channel_id) if self.alert_channel_id else None
             if self.alert_channel_id and not isinstance(channel, discord.TextChannel):
                 raise ValueError("The selected notification channel no longer exists or is not a text channel.")
@@ -840,13 +881,13 @@ class SetupWizard(discord.ui.View):
                 if not permissions.view_channel or not permissions.send_messages:
                     raise ValueError("Give Umask View Channel and Send Messages in the selected alert channel.")
             current = bot.store.config(guild.id)
-            current_snapshot = (tuple(current[k] for k in ('staff_role_id', 'elevated_role_id', 'durations', 'alert_channel_id', 'updated_at')) if current else None)
+            current_snapshot = setup_snapshot(current)
             if current_snapshot != self.config_snapshot:
                 raise ValueError("Setup has changed since this form was opened. Run `/setup` again to review the latest configuration.")
             if (current and bot.privacy_ledger.guild_pending_erasure(guild.id, current['updated_at'])
                     and bot.store.count_sessions(guild.id)):
                 raise ValueError("This server's privacy deletion is awaiting role cleanup. Wait until all tracked sessions are safely removed before reconfiguring.")
-            changed = bot.store.set_config(guild.id, staff.id, elevated.id, allowed,
+            changed = bot.store.set_config(guild.id, staff.id, self.elevated_role_ids, allowed,
                                            channel.id if channel else None)
         except (ValueError, discord.HTTPException) as exc:
             return await interaction.edit_original_response(embed=self.render(error=str(exc)), view=self)
@@ -855,15 +896,15 @@ class SetupWizard(discord.ui.View):
         confirmation = brand_embed(
             "Setup saved",
             f"**Permanent staff:** {staff.mention}\n"
-            f"**Elevated role:** {elevated.mention}\n"
-            f"**Allowed sessions:** {', '.join(map(pretty_duration, allowed))}\n"
+            f"**Elevated roles:** {', '.join(role.mention for role in elevated_roles)}\n"
+            f"**Maximum session:** {pretty_duration(self.max_duration)}\n"
             f"**Shutdown alerts:** {channel.mention if channel else 'Disabled'}\n\n"
             "Umask will **not** change role permissions for you. "
             "Remove protected powers from permanent roles, then use `/issue` to authorise staff.",
         )
         if changed:
             confirmation.add_field(name="Important: roles changed",
-                                   value="Existing staff credentials were invalidated. Issue new credentials with `/issue`.",
+                                   value="Credentials affected by removed roles or a changed staff role were invalidated. Reissue them with `/issue`.",
                                    inline=False)
         await interaction.edit_original_response(embed=confirmation, view=None)
 
@@ -910,6 +951,7 @@ async def setup(interaction: discord.Interaction):
 
 
 async def _issue_credential(interaction: discord.Interaction, member_id: int, *,
+                            requested_role_id: int | None = None,
                             replacing: tuple[int, str] | None = None) -> None:
     """Issue under the per-member lock, or require confirmation for replacement.
 
@@ -929,30 +971,42 @@ async def _issue_credential(interaction: discord.Interaction, member_id: int, *,
             if bot.privacy_ledger.guild_pending_erasure(interaction.guild_id, cfg['updated_at']):
                 raise ValueError("This server's previous Umask setup is being removed under a verified privacy request. Reconfigure only after pending roles are cleared.")
             member = await bot.get_member(interaction.guild, member_id)
-            role = interaction.guild.get_role(cfg['elevated_role_id'])
+            managed = configured_role_ids(cfg)
+            if requested_role_id is None:
+                if len(managed) != 1:
+                    raise ValueError("This server has multiple elevated roles. Choose which role to issue using the `role` option.")
+                selected_id = managed[0]
+            else:
+                selected_id = requested_role_id
+                if selected_id not in managed:
+                    raise ValueError("That role is not an elevated role configured in `/setup`.")
+            role = interaction.guild.get_role(selected_id)
             if not member or not role:
-                raise ValueError("Staff member or configured active role is missing.")
+                raise ValueError("Staff member or configured elevated role is missing.")
             if member.bot or member.id == interaction.guild.owner_id:
                 raise ValueError("Choose a human staff member who is not the server owner.")
             await bot.verify_bot_role(interaction.guild, role)
-            problem = permissions_issue(member, cfg['staff_role_id'], role)
+            session = bot.store.session(interaction.guild_id, member_id)
+            tracked_role_id = int(session['role_id']) if session else None
+            problem = permissions_issue(member, cfg['staff_role_id'], role,
+                                        tracked_role_id=tracked_role_id)
             if problem:
                 raise ValueError(problem)
-            if bot.store.session(interaction.guild_id, member_id):
-                raise ValueError("This member still has a tracked active session. Use `/revoke` first to end it and replace the key.")
-            if role.id in {r.id for r in member.roles}:
+            if role.id in {r.id for r in member.roles} and role.id != tracked_role_id:
                 raise ValueError("The member already has the active role outside a tracked session. Remove it manually first.")
 
             existing = bot.store.credential(interaction.guild_id, member_id)
             if replacing is None and existing is not None:
                 # No write occurs until the owner explicitly confirms.
                 view = ConfirmCredentialReplacement(
-                    interaction, member_id,
+                    interaction, member_id, selected_id,
                     (int(existing['issued_at']), existing['phrase_hash']))
                 embed = brand_embed(
                     "Replace existing credential?",
-                    f"{member.mention} already has an issued code.\n\n"
-                    "Issuing another will **immediately invalidate the old phrase**. "
+                    f"{member.mention} already has an issued code.\n"
+                    f"New elevated role: {role.mention}.\n\n"
+                    "Issuing another will **immediately invalidate the old phrase** "
+                    "and **end any active session**, removing its elevated role. "
                     "They'll need to run `/receive` again within 15 minutes "
                     "to collect the new one.\n\n"
                     "Issue a replacement?",
@@ -964,13 +1018,27 @@ async def _issue_credential(interaction: discord.Interaction, member_id: int, *,
                     (int(existing['issued_at']), existing['phrase_hash']) != replacing):
                 raise ValueError("That credential has changed or been revoked since you opened the confirmation. Run `/issue` again to review the current state.")
 
+            # Prepare the replacement before disrupting an existing session.
             phrase = generate_phrase()
             digest = await asyncio.to_thread(hash_phrase, phrase)
             cipher = bot.fernet.encrypt(phrase.encode('utf-8'))
             async with bot.shutdown_lock:
                 if bot.maintenance_mode or bot._closing_gatekeeper or bot._shutdown_requested:
                     raise ValueError('Umask entered maintenance while issuing this credential. No credential was issued.')
-                bot.store.issue(interaction.guild_id, member_id, digest, cipher, int(time.time()) + 900)
+                # Do not replace a credential while its old elevated role may
+                # remain assigned. On a Discord failure leave the old code
+                # intact and record a pending revocation for reconciliation.
+                session = bot.store.session(interaction.guild_id, member_id)
+                if session:
+                    old_role = interaction.guild.get_role(session['role_id'])
+                    if old_role and old_role.id in {r.id for r in member.roles}:
+                        try:
+                            await member.remove_roles(old_role, reason='Umask: owner replaced authentication credential')
+                        except (discord.Forbidden, discord.HTTPException):
+                            bot.store.force_expire(interaction.guild_id, member_id, 'credential_replacement')
+                            raise ValueError('Could not remove the current elevated role. The old credential was not replaced; Umask will retry session cleanup.')
+                    bot.store.end_session(interaction.guild_id, member_id, 'credential_replaced')
+                bot.store.issue(interaction.guild_id, member_id, digest, cipher, int(time.time()) + 900, selected_id)
     except (ValueError, discord.HTTPException) as error:
         await interaction.edit_original_response(
             content=None, embed=brand_embed("Credential not issued", f"{error}", accent="warning"),
@@ -982,6 +1050,7 @@ async def _issue_credential(interaction: discord.Interaction, member_id: int, *,
         embed=brand_embed(
             "Credential issued",
             f"**Credential issued for {member.display_name}** (`{member.id}`) in this server.\n"
+            f"**Elevated role:** {role.mention}\n"
             f"`{phrase}`\n\n"
             "**Shown once to you.** The staff member must use the **new** phrase. "
             "They can run `/receive` within 15 minutes to collect it privately once. "
@@ -997,12 +1066,13 @@ class ConfirmCredentialReplacement(discord.ui.View):
     """Ephemeral owner-only confirmation; no persistent credential changes until clicked."""
 
     def __init__(self, source_interaction: discord.Interaction, member_id: int,
-                 expected_credential: tuple[int, str]):
+                 requested_role_id: int, expected_credential: tuple[int, str]):
         super().__init__(timeout=120)
         self.source_interaction = source_interaction
         self.guild_id = source_interaction.guild_id
         self.owner_id = source_interaction.user.id
         self.member_id = member_id
+        self.requested_role_id = requested_role_id
         self.expected_credential = expected_credential
         self.used = False
 
@@ -1026,6 +1096,7 @@ class ConfirmCredentialReplacement(discord.ui.View):
         # Edit the original ephemeral /issue response. This also lets the normal
         # one-time secret-deletion task remove the phrase from that response.
         await _issue_credential(self.source_interaction, self.member_id,
+                                requested_role_id=self.requested_role_id,
                                 replacing=self.expected_credential)
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
@@ -1051,13 +1122,14 @@ class ConfirmCredentialReplacement(discord.ui.View):
 @bot.tree.command(name="issue", description="Issue a staff authentication code.")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
-async def issue(interaction: discord.Interaction, member: discord.Member):
+@app_commands.describe(role="Elevated role to assign (required only when multiple roles are configured)")
+async def issue(interaction: discord.Interaction, member: discord.Member, role: discord.Role | None = None):
     if bot.maintenance_mode:
         return await reply(interaction, 'Umask is in maintenance mode. New credentials cannot be issued.')
     if not require_owner(interaction):
         return await reply(interaction, "Only the server owner can issue credentials.")
     await interaction.response.defer(ephemeral=True, thinking=True)
-    await _issue_credential(interaction, member.id)
+    await _issue_credential(interaction, member.id, requested_role_id=role.id if role else None)
 
 
 @bot.tree.command(name="receive", description="Collect your authentication code.")
@@ -1112,9 +1184,9 @@ class AuthenticationModal(discord.ui.Modal, title="Authenticate"):
                 return await reply(interaction, "Umask is not configured.")
             if bot.privacy_ledger.guild_pending_erasure(gid, cfg['updated_at']):
                 return await reply(interaction, "This server's Umask setup is pending deletion; authentication is disabled until it is reconfigured.")
-            allowed = parse_durations(cfg['durations'])
-            if self.duration not in allowed:
-                return await reply(interaction, f"The owner permits: {', '.join(map(str, allowed))} minutes.")
+            max_minutes = maximum_duration(cfg['durations'])
+            if not 5 <= self.duration <= max_minutes:
+                return await reply(interaction, f"Choose between 5 and {max_minutes} minutes.")
             # Recheck before evaluating the secret: staff could lose the role
             # after opening the modal, or while the modal is sitting open.
             try:
@@ -1133,7 +1205,10 @@ class AuthenticationModal(discord.ui.Modal, title="Authenticate"):
                 locked = bot.store.failed_attempt(gid, uid, now)
                 return await reply(interaction, "Incorrect phrase. " + ("Further attempts are temporarily locked." if locked else "Please try again."))
             bot.store.reset_attempts(gid, uid)
-            role = interaction.guild.get_role(cfg['elevated_role_id'])
+            assigned_role_id = credential_role_id(cred, cfg)
+            if assigned_role_id not in configured_role_ids(cfg):
+                return await reply(interaction, 'Your assigned elevated role is no longer configured. Ask the owner to reissue your credential.')
+            role = interaction.guild.get_role(assigned_role_id)
             if not role:
                 return await reply(interaction, "The active role was deleted. Ask the owner to reconfigure the bot.")
             try:
@@ -1186,10 +1261,10 @@ async def authenticate(interaction: discord.Interaction, duration_minutes: int |
         return await reply(interaction, "Umask is not configured on this server.")
     if bot.privacy_ledger.guild_pending_erasure(interaction.guild_id, cfg['updated_at']):
         return await reply(interaction, "The server's previous Umask setup is pending deletion.")
-    allowed = parse_durations(cfg['durations'])
-    duration = duration_minutes if duration_minutes is not None else (60 if 60 in allowed else allowed[0])
-    if duration not in allowed:
-        return await reply(interaction, f"Allowed durations: {', '.join(map(str, allowed))} minutes.")
+    max_minutes = maximum_duration(cfg['durations'])
+    duration = duration_minutes if duration_minutes is not None else max_minutes
+    if not 5 <= duration <= max_minutes:
+        return await reply(interaction, f"Choose a duration between 5 and {max_minutes} minutes.")
     try:
         member = await bot.get_member(interaction.guild, interaction.user.id)
     except (discord.HTTPException, discord.Forbidden):
@@ -1233,7 +1308,7 @@ async def revoke_staff_credential(guild: discord.Guild, user_id: int) -> bool:
         bot.store.revoke_credential(gid, uid)
         session = bot.store.session(gid, uid)
         cfg = bot.store.config(gid)
-        role_id = session['role_id'] if session else (cfg['elevated_role_id'] if cfg else None)
+        role_id = session['role_id'] if session else None
         role = guild.get_role(role_id) if role_id else None
         try:
             member = await bot.get_member(guild, uid)
@@ -1466,14 +1541,14 @@ class OwnerStatusView(discord.ui.View):
             e.add_field(name="Tracked sessions", value=f"**{active}**", inline=True)
             e.add_field(name="Completed sessions", value=f"**{completed}**", inline=True)
             staff = self.guild.get_role(cfg['staff_role_id'])
-            elevated = self.guild.get_role(cfg['elevated_role_id'])
+            elevated = [self.guild.get_role(rid) for rid in configured_role_ids(cfg)]
             e.add_field(name="Permanent staff role", value=staff.mention if staff else "⚠️ Missing role", inline=True)
-            e.add_field(name="Elevated role", value=elevated.mention if elevated else "⚠️ Missing role", inline=True)
+            e.add_field(name="Elevated roles", value=", ".join(r.mention if r else "⚠️ Missing role" for r in elevated), inline=False)
             try:
-                duration_text = ", ".join(pretty_duration(x) for x in parse_durations(cfg['durations']))
+                duration_text = pretty_duration(maximum_duration(cfg['durations']))
             except ValueError:
                 duration_text = "Invalid configuration — review `/setup`"
-            e.add_field(name="Allowed sessions", value=duration_text, inline=False)
+            e.add_field(name="Maximum session duration", value=duration_text, inline=False)
             current = bot.store.sessions_for_guild(gid, 3)
             if current:
                 lines = []
@@ -1504,7 +1579,8 @@ class OwnerStatusView(discord.ui.View):
                         notes.append(f"⚠ Staff role absent since <t:{r['staff_missing_since']}:R>")
                     if r['permission_warning_key']:
                         notes.append("⚠ Member has Administrator or Manage Roles through another role")
-                    detail = f"Issued <t:{r['issued_at']}:f>\n{credential_state(r, now)}"
+                    assigned = self.guild.get_role(r['role_id']) if r['role_id'] else None
+                    detail = f"Role: {assigned.mention if assigned else '⚠️ Missing role'}\nIssued <t:{r['issued_at']}:f>\n{credential_state(r, now)}"
                     if notes:
                         detail += '\n' + '\n'.join(notes)
                     e.add_field(name=labels[r['user_id']], value=detail, inline=False)
@@ -1947,7 +2023,7 @@ async def status(interaction: discord.Interaction):
         return await reply(interaction, "You do not have the permanent staff role needed to use Umask here.")
     sess = bot.store.session(interaction.guild_id, interaction.user.id)
     credential = bot.store.credential(interaction.guild_id, interaction.user.id)
-    role = interaction.guild.get_role(cfg['elevated_role_id'])
+    role = interaction.guild.get_role(credential_role_id(credential, cfg)) if credential else None
     embed = brand_embed("Your access", "Your staff authentication status is private to you.")
     now = int(time.time())
     if credential is None:

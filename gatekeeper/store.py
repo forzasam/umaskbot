@@ -1,5 +1,6 @@
 """Small durable SQLite state store. One process; no member-list intent needed."""
 import sqlite3
+import json
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -66,6 +67,15 @@ class Store:
         ):
             if column not in credential_columns:
                 self.conn.execute(f"ALTER TABLE credentials ADD COLUMN {column} {ddl}")
+        config_columns = {r['name'] for r in self.conn.execute("PRAGMA table_info(guild_config)")}
+        if 'elevated_roles' not in config_columns:
+            self.conn.execute("ALTER TABLE guild_config ADD COLUMN elevated_roles TEXT")
+        if 'role_id' not in credential_columns:
+            self.conn.execute("ALTER TABLE credentials ADD COLUMN role_id INTEGER")
+        # Preserve original single-role credentials on upgrade.
+        self.conn.execute("""UPDATE credentials SET role_id=(SELECT elevated_role_id
+            FROM guild_config WHERE guild_config.guild_id=credentials.guild_id)
+            WHERE role_id IS NULL""")
         history_columns = {r['name'] for r in self.conn.execute("PRAGMA table_info(session_history)")}
         if 'hold_until' not in history_columns:
             self.conn.execute("ALTER TABLE session_history ADD COLUMN hold_until INTEGER")
@@ -94,20 +104,40 @@ class Store:
     def configured_guild_ids(self) -> set[int]:
         return {int(row[0]) for row in self.conn.execute('SELECT guild_id FROM guild_config')}
 
-    def set_config(self, guild_id, staff_role_id, elevated_role_id, durations, alert_channel_id):
-        existing = self.config(guild_id)
-        change = bool(existing and (existing['staff_role_id'] != staff_role_id or existing['elevated_role_id'] != elevated_role_id))
-        if change and self.count_sessions(guild_id):
-            raise ValueError("Sign out or revoke all active sessions before changing protected roles.")
+    def managed_roles(self, guild_id):
+        cfg = self.config(guild_id)
+        if not cfg:
+            return ()
+        raw = cfg['elevated_roles']
+        return tuple(int(x) for x in json.loads(raw)) if raw else (int(cfg['elevated_role_id']),)
+
+    def set_config(self, guild_id, staff_role_id, elevated_role_ids, durations, alert_channel_id):
+        roles = tuple(sorted(set(int(x) for x in elevated_role_ids)))
+        if not roles or len(roles) > 25:
+            raise ValueError('Select between 1 and 25 elevated roles.')
+        old = self.config(guild_id)
+        old_roles = set(self.managed_roles(guild_id)) if old else set()
+        removed = old_roles - set(roles)
+        staff_changed = bool(old and int(old['staff_role_id']) != staff_role_id)
+        changed = bool(old and (staff_changed or removed))
+        if changed and self.count_sessions(guild_id):
+            raise ValueError('Sign out or revoke all active sessions before removing protected roles or changing the staff role.')
         with self.tx():
-            if change:
-                self.conn.execute("DELETE FROM credentials WHERE guild_id=?", (guild_id,))
-            self.conn.execute("""INSERT INTO guild_config VALUES (?,?,?,?,?,?)
-              ON CONFLICT(guild_id) DO UPDATE SET staff_role_id=excluded.staff_role_id,
-              elevated_role_id=excluded.elevated_role_id, durations=excluded.durations,
-              alert_channel_id=excluded.alert_channel_id, updated_at=excluded.updated_at""",
-              (guild_id, staff_role_id, elevated_role_id, ','.join(map(str, durations)), alert_channel_id, int(time.time())))
-        return change
+            if staff_changed:
+                self.conn.execute('DELETE FROM credentials WHERE guild_id=?', (guild_id,))
+            elif removed:
+                self.conn.executemany('DELETE FROM credentials WHERE guild_id=? AND role_id=?',
+                                      [(guild_id, r) for r in removed])
+            primary = int(old['elevated_role_id']) if old and int(old['elevated_role_id']) in roles else roles[0]
+            self.conn.execute("""INSERT INTO guild_config
+              (guild_id,staff_role_id,elevated_role_id,durations,alert_channel_id,updated_at,elevated_roles)
+              VALUES (?,?,?,?,?,?,?) ON CONFLICT(guild_id) DO UPDATE SET
+              staff_role_id=excluded.staff_role_id,elevated_role_id=excluded.elevated_role_id,
+              durations=excluded.durations,alert_channel_id=excluded.alert_channel_id,
+              updated_at=excluded.updated_at,elevated_roles=excluded.elevated_roles""",
+              (guild_id, staff_role_id, primary, ','.join(map(str,durations)),
+               alert_channel_id, int(time.time()), json.dumps(roles)))
+        return changed
 
     def count_sessions(self, guild_id):
         return self.conn.execute("SELECT COUNT(*) FROM sessions WHERE guild_id=?",(guild_id,)).fetchone()[0]
@@ -136,7 +166,7 @@ class Store:
 
     def credentials_for_guild(self, guild_id, limit=10, offset=0):
         """Read-only owner inventory. Never SELECT phrase hashes or escrow ciphertext."""
-        return self.conn.execute("""SELECT user_id, issued_at, pending_until,
+        return self.conn.execute("""SELECT user_id, role_id, issued_at, pending_until,
                  CASE WHEN pending_secret IS NOT NULL THEN 1 ELSE 0 END AS has_pending_copy,
                  collected_at, staff_missing_since, staff_loss_notified_at, permission_warning_key
             FROM credentials WHERE guild_id=?
@@ -144,17 +174,17 @@ class Store:
             (guild_id, limit, offset)
         ).fetchall()
 
-    def issue(self, guild_id, user_id, hash_value, encrypted, valid_until):
+    def issue(self, guild_id, user_id, hash_value, encrypted, valid_until, role_id):
         with self.tx():
             self.conn.execute("""INSERT INTO credentials
-              (guild_id,user_id,phrase_hash,pending_secret,pending_until,issued_at,attempts,locked_until,collected_at)
-              VALUES (?,?,?,?,?,?,0,0,0) ON CONFLICT(guild_id,user_id) DO UPDATE SET
+              (guild_id,user_id,phrase_hash,pending_secret,pending_until,issued_at,attempts,locked_until,collected_at,role_id)
+              VALUES (?,?,?,?,?,?,0,0,0,?) ON CONFLICT(guild_id,user_id) DO UPDATE SET
               phrase_hash=excluded.phrase_hash,pending_secret=excluded.pending_secret,
               pending_until=excluded.pending_until,issued_at=excluded.issued_at,
-              collected_at=0,attempts=0,locked_until=0,
+              collected_at=0,role_id=excluded.role_id,attempts=0,locked_until=0,
               staff_missing_since=NULL,staff_loss_notified_at=NULL,
               permission_warning_key=NULL""",
-              (guild_id,user_id,hash_value,encrypted,valid_until,int(time.time())))
+              (guild_id,user_id,hash_value,encrypted,valid_until,int(time.time()),role_id))
 
     def monitor_credential_batch(self, limit: int = 40, offset: int = 0):
         """Bounded scan of credential holders, never all guild members."""
